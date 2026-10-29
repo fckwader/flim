@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { WebSocket } from "ws";
-import { LOCK_TTL_MS, Op, PeerInfo, Role, ServerMsg, UnitKey, UserInfo } from "./protocol";
+import { addWsEgress } from "./egress";
+import { LOCK_TTL_MS, NotesMode, Op, PeerInfo, Role, ServerMsg, UnitKey, UserInfo } from "./protocol";
 
 export interface Client {
   ws: WebSocket;
@@ -16,7 +17,10 @@ interface Lock {
 }
 
 export function send(ws: WebSocket, msg: ServerMsg): void {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const data = JSON.stringify(msg);
+  addWsEgress(ws, Buffer.byteLength(data));
+  ws.send(data);
 }
 
 const sha = (v: string) => crypto.createHash("sha256").update(v, "utf8").digest();
@@ -29,6 +33,7 @@ export class Session {
   leaderId: string;
   lastActive = Date.now(); // any message from any member; idle sessions are closed
   readonly endsAt: number | null; // time limit (null = none)
+  readonly notesMode: NotesMode;   // the host's choice, fixed for the session
   private pwHash: Buffer;
   private ended = false;
   private clients = new Set<Client>();
@@ -38,9 +43,11 @@ export class Session {
   private epoch = 0;
   private onEmpty: () => void;
 
-  constructor(code: string, password: string, leader: Client, endsAt: number | null, onEmpty: () => void) {
+  constructor(code: string, password: string, leader: Client, endsAt: number | null, onEmpty: () => void,
+              notesMode: NotesMode = "lock") {
     this.code = code;
     this.endsAt = endsAt;
+    this.notesMode = notesMode;
     this.pwHash = sha(password);
     this.leaderId = leader.user.id;
     this.onEmpty = onEmpty;
@@ -103,7 +110,7 @@ export class Session {
     this.clients.add(client);
     send(client.ws, {
       t: "welcome", session: this.code, role: client.role, you: client.user, peers: this.peers(), blob: this.blobKey,
-      ends_in: this.endsAt === null ? 0 : Math.max(1, this.endsAt - Date.now()),
+      ends_in: this.endsAt === null ? 0 : Math.max(1, this.endsAt - Date.now()), notes: this.notesMode,
     });
     send(client.ws, { t: "snapshot", flp: this.flp, epoch: this.epoch });
     send(client.ws, { t: "lock_state", locks: [...this.locks].map(([key, l]) => ({ key, owner: l.owner })) });

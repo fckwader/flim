@@ -2,7 +2,8 @@ import crypto from "crypto";
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { dropBlobs, handleBlob } from "./blobs";
-import { ClientMsg, PING_INTERVAL_MS, UserInfo } from "./protocol";
+import { egressLimits, egressRefusal, setWsIp } from "./egress";
+import { CAP_NOTES_MERGE, ClientMsg, NotesMode, PING_INTERVAL_MS, UserInfo } from "./protocol";
 import { Client, Session, send } from "./session";
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -48,7 +49,7 @@ function ownerKeyOk(given: unknown): boolean {
 const sessions = new Map<string, Session>(); // slot -> session
 const blobKeys = new Map<string, Session>(); // blob key -> session
 
-function openSession(slot: string, password: string, leader: Client): Session {
+function openSession(slot: string, password: string, leader: Client, notes: NotesMode): Session {
   const endsAt = slot === OWNER_SLOT || !SESSION_MS ? null : Date.now() + SESSION_MS;
   const session: Session = new Session(slot, password, leader, endsAt, () => {
     // only the session that holds the slot may free it (a stale one must not drop its successor)
@@ -56,7 +57,7 @@ function openSession(slot: string, password: string, leader: Client): Session {
     blobKeys.delete(session.blobKey);
     dropBlobs(session.blobKey);
     console.log(`[${slot}] session ended`);
-  });
+  }, notes);
   sessions.set(slot, session);
   blobKeys.set(session.blobKey, session);
   return session;
@@ -110,7 +111,7 @@ session password the host gave you.</p></body>`;
 // Health check for the Fly proxy (TCP connect here also wakes a stopped machine), the sample
 // file store (blobs.ts), and a short page for session links opened in a browser.
 const httpServer = http.createServer((req, res) => {
-  if (handleBlob(req, res, (key) => blobKeys.has(key))) return;
+  if (handleBlob(req, res, (key) => blobKeys.has(key), clientIp(req))) return;
   const url = (req.url ?? "").split("?")[0];
   if (url === "/health" || url === "/") {
     res.writeHead(200, { "content-type": "text/plain" });
@@ -160,6 +161,8 @@ function rateOk(conn: Conn): boolean {
 
 function handlePreSession(ws: WebSocket, conn: Conn, msg: ClientMsg): void {
   if (msg.t !== "host" && msg.t !== "join") return fail(ws, "not_joined", "Host or join a session first.");
+  const budget = egressRefusal(conn.ip); // data budget (egress.ts): no new sessions / members
+  if (budget) return refuse(ws, "data_limit", budget);
   if (failCount(conn.ip) >= FAIL_MAX) {
     return refuse(ws, "too_many_attempts", "Too many wrong passwords. Try again in a few minutes.");
   }
@@ -199,8 +202,9 @@ function handlePreSession(ws: WebSocket, conn: Conn, msg: ClientMsg): void {
     }
     const client: Client = { ws, user, role: "leader", alive: true, ip: conn.ip };
     conn.client = client;
-    conn.session = openSession(slot, password, client);
-    console.log(`[${slot}] hosted by ${user.name}`);
+    const notes: NotesMode = msg.notes === "merge" ? "merge" : "lock";
+    conn.session = openSession(slot, password, client, notes);
+    console.log(`[${slot}] hosted by ${user.name} (notes: ${notes})`);
     return;
   }
 
@@ -216,6 +220,9 @@ function handlePreSession(ws: WebSocket, conn: Conn, msg: ClientMsg): void {
   }
   if (session.hasUser(user.id)) return refuse(ws, "id_in_use", "You are already in this session.");
   if (session.size >= MAX_MEMBERS) return refuse(ws, "session_full", `That session already has ${MAX_MEMBERS} people.`);
+  if (session.notesMode === "merge" && !(Array.isArray(msg.caps) && msg.caps.includes(CAP_NOTES_MERGE))) {
+    return refuse(ws, "notes_merge", "This session merges simultaneous note edits, which your flim can't do yet. Update flim to join.");
+  }
   const client: Client = { ws, user, role: "member", alive: true, ip: conn.ip };
   conn.client = client;
   conn.session = session;
@@ -256,6 +263,7 @@ function handleInSession(ws: WebSocket, client: Client, session: Session, msg: C
 
 wss.on("connection", (ws, req) => {
   const conn: Conn = { ip: clientIp(req), tokens: RATE_BURST, tokensAt: Date.now() };
+  setWsIp(ws, conn.ip);
   conns.set(ws, conn);
   const n = (connsPerIp.get(conn.ip) ?? 0) + 1;
   connsPerIp.set(conn.ip, n);
@@ -361,5 +369,6 @@ httpServer.listen(PORT, () => {
       ? `flim-server listening on :${PORT} (public: slots ${OWNER_SLOT}, ${PUBLIC_SLOTS.join(" ")}; ` +
           `${SESSION_MS / 60_000} min sessions, ${COOLDOWN_MS / 60_000} min cooldown)`
       : `flim-server listening on :${PORT} (self-hosted: one session)`,
+    `| ${egressLimits()}`,
   );
 });

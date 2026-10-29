@@ -69,8 +69,9 @@ Want no time limit? [Run your own server](#server): it's one `npm start`, and it
 ### What's synced
 | Synced | Not yet |
 |---|---|
-| Channel volume / pan / on-off / mixer routing | Samples inside plugins that store them compressed or encrypted (Kontakt, ...) |
-| Every plugin parameter (generators and effects) | Showing other people's selection inside an editor |
+| Tempo, main volume, main pitch, shuffle | Samples inside plugins that store them compressed or encrypted (Kontakt, ...) |
+| Channel volume / pan / on-off / mixer routing | Showing other people's selection inside an editor |
+| Every plugin parameter (generators and effects) | |
 | Full plugin state (presets, wavetables, ...) | |
 | Mixer volume / pan / stereo separation / mute | |
 | Mixer track names, colors and routing (sends on/off and send levels) | |
@@ -86,13 +87,24 @@ Want no time limit? [Run your own server](#server): it's one `npm start`, and it
 | Opening or loading a project (the leader's project is sent to everyone) | |
 | Which window everyone is working in, and where their mouse is in the piano roll and playlist (see [Who's where](#whos-where)) | |
 
-**Locks:** while you tweak a mixer knob, change a plugin, edit a pattern's notes or edit the playlist,
-that part is yours. If someone else touches it at the same time, their change is undone and FL's hint bar
-shows *"Pattern 3 is being edited by Alex"* or *"Channel 'Serum 2' is being edited by Alex"*. A plugin is
-locked as a whole: any knob or preset change on it takes the lock. Locks are released shortly after you
-stop: about 0.6 s for a channel or mixer knob, 2 s for a plugin, a pattern or the playlist.
+**Locks:** while you turn a knob, edit one instrument's notes in a pattern or edit a playlist track,
+that part is yours. Locks are small, so two people rarely collide: every knob (including every plugin
+parameter) is locked on its own, a pattern's notes per channel (you on the kick, your friend on the hats
+of the same pattern is fine), and the playlist per track. A whole plugin is only locked while its preset
+or state changes. If someone else touches your part at the same time, their change is undone and FL's
+hint bar shows *"Channel 2 in pattern 3 is being edited by Alex"*. Locks are released shortly after you
+stop (about 0.6 s for a knob, 1 s for notes and playlist tracks).
 Names, colors, routing, markers and the time signature have no locks; if two people change the same
 one at the same moment, the leader's change wins.
+
+**Lock or Merge for notes:** whoever hosts picks how notes behave when two people edit the *same*
+instrument in the same pattern at once (the **(i)** next to the choice in the Host dialog explains it):
+- **Lock** (default): one person at a time, as above.
+- **Merge**: both people's notes are kept and combined, nothing is undone. Merge is
+  [cashflowbeatz](https://github.com/cashflowbeatz)'s note merging (a CRDT, `client/common/flim_notes_crdt.h`).
+
+**Fast changes:** when you scroll a knob or the tempo quickly (130 → 131 → … → 140), flim sends the
+latest value instead of every step, and the receiving side skips steps that are already outdated.
 
 ### Who's where
 The status next to the Connect button shows the window each other person last clicked or typed in,
@@ -102,6 +114,11 @@ Hover over it to see everyone in FL's hint bar.
 When someone's mouse is over the piano roll or the playlist, you see a small arrow with their name at
 the same spot in yours (the same note and bar, whatever your zoom or scroll), as long as you are looking
 at the same pattern or arrangement. The arrows can't be clicked and never get in your way.
+
+**What others just changed glows in their color** and fades out over 1.5 seconds: notes they added or
+changed in the piano roll, clips in the playlist, and for knobs the window the knob is in (the plugin or
+effect window if it's open, otherwise the channel rack or the mixer). Exact knobs can't be outlined:
+FL draws its mixer and channel rack as one picture, and plugin windows are a closed box to FL.
 
 ---
 
@@ -124,10 +141,13 @@ at the same pattern or arrangement. The arrows can't be clicked and never get in
    - a **name** that the others will see (letters, digits, spaces, `- _ .`, up to 24 characters).
 3. FL Studio opens. In the top toolbar, to the right of the meters:
 
-   `[ Connect ] [ Host ]  ● Not connected`
+   `[ Connect ] [ Host ] [ Rooms ]  ● Not connected`
+
+   (**Rooms** opens cashflowbeatz's separate flimrooms app, see [Rooms](#rooms-by-cashflowbeatz).)
 
 4. **To start a session**, click **Host**. Enter the server (e.g. `flim.fly.dev`) and a session
-   password (a random one is filled in; change it if you like), click **Host**. flim shows your
+   password (a random one is filled in; change it if you like), pick **Lock** or **Merge** for notes
+   (see [Lock or Merge](#whats-synced)), click **Host**. flim shows your
    **session link** (e.g. `https://flim.fly.dev/03`) and the password, with a **Copy** button: send
    both to the people you want to play with. Click the status text later to see them again.
    If every session on the server is taken, you're told so; try again later.
@@ -195,6 +215,22 @@ both when the leader's project is sent and when someone loads a new sample durin
 | `ws://203.0.113.7:8080` | a server over the internet, unencrypted |
 | `wss://flim.example.com` | a server behind HTTPS (encrypted, port 443) |
 | `flim.example.com` | same thing: a bare host name means `wss://`, port 443 |
+
+### Rooms (by cashflowbeatz)
+**Rooms is entirely [cashflowbeatz](https://github.com/cashflowbeatz)'s work**: the flimrooms app, its
+design, its relay and the flim engine it runs are all his. flim only adds the **Rooms** button that opens it.
+
+flimrooms is a separate Windows app: create or join a room with your name and an 8-digit code. It
+starts its own FL Studio with its own flim and connects through cashflowbeatz's relay (on Cloudflare),
+so the projects and samples of Rooms sessions go through his server, not `flim.fly.dev` or yours.
+Rooms sessions and Host / Connect sessions don't mix.
+
+- Download `flim-rooms-<version>-win64.exe` from the [latest release](../../releases/latest) (a
+  separate download from `flim-client-win64.zip`). It's a portable app: no installer.
+- Put it in a `rooms` folder next to `flim.exe`, next to `flim.exe` itself, or leave it in your
+  Downloads folder, and the **Rooms** button finds it. Otherwise the button asks where it is (once) or
+  takes you to the download.
+- Rooms is experimental. Questions and bugs about it go to cashflowbeatz.
 
 ### Changing your settings
 Run `flim.exe --setup` to change your FL folder or name. You can also change your name in the
@@ -278,7 +314,8 @@ client/                 the FL side (C, Win32)
   launcher/flim.c       flim.exe: setup window, starts FL, loads the engine into it
   engine/flim_engine.c  the engine: edit detection, applying edits, locks, pattern ops, sample transfer,
                         networking, toolbar UI (status + who is where)
-  common/               settings (flim.ini) and resource IDs shared by both
+  common/               settings (flim.ini) and resource IDs shared by both;
+                        flim_notes_crdt.h = note merging, by cashflowbeatz
   build.bat             build script (MSVC)
   restart_test.ps1      dev loop: rebuild and start two connected FLs
   dev/                  reverse-engineering and test tools (not built or shipped)
@@ -328,6 +365,15 @@ off and FL runs as usual: nothing breaks, it just doesn't sync. What you can do:
 2. **Add it yourself:** the tools in `client/dev/` map the table from 25.2.3.5171 onto another build
    and test the result. See "Adding an FL build" in [client/dev/README.md](client/dev/README.md).
 3. **Use 25.2.3.5171** if you have it installed.
+
+---
+
+## Credits
+
+- **[cashflowbeatz](https://github.com/cashflowbeatz)**: **Rooms** (the flimrooms app, its relay and
+  its flim engine, all his) and the **note merging** behind the host's *Merge* option
+  (`client/common/flim_notes_crdt.h`, used unchanged). Both come from his
+  [pull request #1](../../pull/1). Thank you!
 
 ---
 

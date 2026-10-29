@@ -11,5 +11,6 @@ server/dist/
 *.log
 *.flp
 *.fst
-# dev tools
+# dev tools (stress_*.json = local test results)
 __pycache__/
+client/dev/stress_*.json

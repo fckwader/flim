@@ -15,6 +15,7 @@ import fs from "fs";
 import http from "http";
 import os from "os";
 import path from "path";
+import { addEgress, egressRefusal } from "./egress";
 
 const ROOT = process.env.FLIM_BLOB_DIR ?? path.join(os.tmpdir(), "flim-blobs");
 const FILE_MAX = Number(process.env.FLIM_BLOB_FILE_MAX ?? 2000 * 1024 * 1024);
@@ -107,6 +108,7 @@ export function handleBlob(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   sessionKeyOk: (key: string) => boolean,
+  ip: string,
 ): boolean {
   const url = (req.url ?? "").split("?")[0];
   const m = /^\/blob\/([0-9a-f]{64})$/.exec(url);
@@ -157,6 +159,16 @@ export function handleBlob(
       res.writeHead(404);
       res.end();
       return true;
+    }
+    if (req.method === "GET") {
+      const why = egressRefusal(ip); // data budget (egress.ts)
+      if (why) {
+        console.log(`[blob] download refused (${ip}): ${why}`);
+        res.writeHead(429, { "content-type": "text/plain" });
+        res.end(why);
+        return true;
+      }
+      addEgress(ip, st.size);
     }
     res.writeHead(200, { "content-type": "application/octet-stream", "content-length": st.size });
     if (req.method === "HEAD") {

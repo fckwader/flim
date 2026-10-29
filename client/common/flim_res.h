@@ -16,6 +16,8 @@
 #define IDC_HPASSWORD    2102
 #define IDC_HOWNER       2103
 #define IDC_HOWNERLBL    2104
+#define IDC_HNOTEMODE    2105
+#define IDC_HNOTEINFO    2106
 
 #define IDD_HOSTED       221
 #define IDC_HINFO        2201

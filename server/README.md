@@ -18,6 +18,11 @@ Sessions `01`-`08` end after 15 minutes (`FLIM_SESSION_MS`; `welcome` carries `e
 minutes (`FLIM_COOLDOWN_MS`; refused with `cooldown` + `retry_in`); sessions without any message for
 5 minutes are closed (`FLIM_IDLE_MS`). Slot `00` has no time limit and no cooldown.
 
+Data budget (optional, `src/egress.ts`): `FLIM_EGRESS_DAY_GB` caps what the server sends per UTC day
+(WebSocket messages + sample downloads) for everyone together, `FLIM_EGRESS_IP_DAY_GB` per client IP.
+Over it, new sessions / joins are refused (`data_limit`) and sample downloads get 429; running sessions
+keep going. Unset = no limit. Useful on a public server: outbound data is what a host bills for.
+
 Limits: 8 people per session, 12 WebSockets per IP (`FLIM_MAX_CONNS_PER_IP`), 8 wrong passwords /
 owner keys per IP per 10 minutes, 400 messages/s per connection (bursts up to 4000).
 

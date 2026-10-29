@@ -36,18 +36,22 @@
 #include <string.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <share.h>
 #include <shlobj.h>
 #include "../common/flim_config.h"
 #include "../common/flim_res.h"
 #include "../common/flim_version.h"
+#include "../common/flim_notes_crdt.h"
 #include <bcrypt.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "version.lib")
 
@@ -259,10 +263,15 @@ static FlBuild g_fl;       // the row in use (engineMain)
 #define IS_MUTE_ID(id)        (((id) & 0xFFF00000u) == 0xF0000000u)
 #define POLL_MS      30
 #define LOCK_IDLE_MS 600           // release a param lock after this much idle
+#define PARAM_SEND_MS 60           // one param.set per value per this interval; the newest value always goes out
 
 typedef uint32_t (*rec_t)(uint32_t id, uint64_t value, uint32_t flags);
 
 static const uint32_t SUBS[NSUB] = { 0, 1, 7, 8 };
+// project-wide REC values (FL's midi.py: REC_Global_First = 0x4000 << 16): main volume, shuffle,
+// main pitch, tempo (BPM x 1000)
+#define REC_GLOBAL_FIRST 0x40000000u
+static const uint32_t GLOBAL_IDS[] = { REC_GLOBAL_FIRST + 0, REC_GLOBAL_FIRST + 1, REC_GLOBAL_FIRST + 2, REC_GLOBAL_FIRST + 5 };
 static const uint32_t MIX_SUBS[] = { 0x1fc0, 0x1fc1, 0x1fc2 };
 
 typedef void (*setenabled_t)(int track, int enabled);
@@ -291,6 +300,22 @@ static void ws_send(const char *msg);
 static void ws_send_samples(char *msg, const unsigned char *blob, size_t n);
 static void samples_rewrite(unsigned char **d, size_t *n);
 static int flp_other_build(const unsigned char *d, size_t n, char *theirs, char *mine);
+static void state_diff_log(const char *what, const unsigned char *a, size_t an, const unsigned char *b, size_t bn);
+static void plug_diff_log(int unit, int a, int b, const unsigned char *d, size_t n);
+static unsigned grp_of(const unsigned char *r, int isPat);
+static int rec_cmp(const void *x, const void *y, size_t sz);
+static void glow_update(void);
+static void glow_param(uint32_t id, COLORREF c);
+static volatile LONG g_notesMerge = 0;       // this session merges simultaneous note edits (welcome: notes)
+static volatile LONG g_hostMerge = 0;        // we host with merge (host dialog / FLIM_NOTES_MODE)
+static void notes_merge_local(int p);
+static void notes_merge_remote(int p, const unsigned char *wire, unsigned bytes, int full);
+static void notes_merge_send_full(int p, int reseed);
+static void notes_merge_send_all(void);
+static void notes_merge_reseed_all(void);
+static void glow_note_sender(const char *m);
+static void grp_local_change(int isPat, int idx, const unsigned char *cur, unsigned n, int fixup);
+static void grp_remote_apply(int isPat, int idx, unsigned g, const unsigned char *recs, unsigned n);
 
 typedef struct {
     uint32_t id;
@@ -301,6 +326,8 @@ typedef struct {
     int  lockedByPeer;
     int  hasUndo;           // plugin param changed while its plugin lock was still requested:
     uint32_t undo;          //   value to restore if the lock is denied
+    DWORD lastSent;         // tick of our last param.set for it (poll thread)
+    int  sendPending;       // changed again within PARAM_SEND_MS: the newest value is still to go out
 } Slot;
 
 static Slot   g_slots[MAX_SLOTS];
@@ -380,6 +407,8 @@ static HINSTANCE g_hinst = NULL;
 #define CLIP_SEL_OFS  0x13         // bit 0x80 = SELECTED (client-only)
 #define CLIP_SEL_BIT  0x80
 #define CLIP_ID_OFS   0x20         // per-instance clip id (FL renumbers on add)
+#define NOTE_GRP_OFS  6            // note record: rack channel (u16); clip record: playlist track field (u16, 499 - index)
+#define CLIP_GRP_OFS  12
 #define CLIPADD_VSLOT   1          // arr->vmt[1](arr, &rec) -> index (kept sorted by position)
 #define CLIPPURGE_VSLOT 3          // arr->vmt[3](arr): drop records marked deleted, free their resources
 #define PLFORM_VA (g_fl.PLFORM)    // global -> var -> playlist form
@@ -446,8 +475,9 @@ static void logmsg(const char *fmt, ...) {
     char path[MAX_PATH];
     GetTempPathA(MAX_PATH, path);
     strcat_s(path, MAX_PATH, "flim_engine.log");
-    FILE *f = NULL;
-    if (fopen_s(&f, path, "a") == 0 && f) {
+    // shared: several FLs (and log readers) use the same file; fopen_s opens it exclusively and lines get lost
+    FILE *f = _fsopen(path, "a", _SH_DENYNO);
+    if (f) {
         SYSTEMTIME t; GetLocalTime(&t);
         fprintf(f, "%02d:%02d:%02d.%03d [%lu] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, GetCurrentProcessId());
         va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
@@ -541,6 +571,7 @@ static int add_slot(uint32_t id) {
 static void rescan(void) {
     LONG before = g_nslot;
     int c, k, t, sl;
+    for (k = 0; k < (int)(sizeof(GLOBAL_IDS) / sizeof(GLOBAL_IDS[0])); k++) add_slot(GLOBAL_IDS[k]);
     for (c = 0; c < MAX_CH; c++) {
         if (read_value((uint32_t)c << 16) == REC_NONE) continue;   // no such channel
         for (k = 0; k < NSUB; k++) add_slot(((uint32_t)c << 16) | SUBS[k]);
@@ -729,6 +760,16 @@ static void enqueue(const QItem *it) {
             }
         }
     }
+    if (it->type == T_PARAM) {
+        // a value still waiting to be applied, with only param writes queued after it: the newer
+        // value replaces it (no point applying 131, 132 ... when 140 is already here)
+        int i = g_qt, k;
+        for (k = 0; k < 512 && i != g_qh; k++) {
+            i = (i - 1 + QCAP) % QCAP;
+            if (g_q[i].type != T_PARAM) break;
+            if (g_q[i].id == it->id) { g_q[i].v = it->v; LeaveCriticalSection(&g_qLock); return; }
+        }
+    }
     int nt = (g_qt + 1) % QCAP;
     if (nt != g_qh) { g_q[g_qt] = *it; g_qt = nt; }
     else logmsg("queue full, dropped task type %d", it->type);
@@ -736,14 +777,19 @@ static void enqueue(const QItem *it) {
     if (g_mainWnd) PostMessageW(g_mainWnd, WM_NULL, 0, 0); // wake the main thread
 }
 
-static void enqueue_apply(uint32_t id, uint32_t v) {
+// glow: 0, or 0x80000000 | the sender's color (their change glows here once applied)
+static void enqueue_apply_glow(uint32_t id, uint32_t v, int glow) {
     QItem it; memset(&it, 0, sizeof(it));
-    it.type = T_PARAM; it.id = id; it.v = v;
+    it.type = T_PARAM; it.id = id; it.v = v; it.mode = glow;
     enqueue(&it);
 }
+static void enqueue_apply(uint32_t id, uint32_t v) { enqueue_apply_glow(id, v, 0); }
+
+static void unit_load_pending(int unit, int a, int b);
 
 static void enqueue_unit(int type, int unit, int a, int b, int mode, char *path) {
     QItem it; memset(&it, 0, sizeof(it));
+    if (type == T_LOAD) unit_load_pending(unit, a, b);
     it.type = type; it.unit = unit; it.a = a; it.b = b; it.mode = mode; it.path = path;
     enqueue(&it);
 }
@@ -788,6 +834,25 @@ static volatile LONG g_tmpSeq = 0;
 static Unit *unit_ptr(int unit, int a, int b) {
     if (unit == U_CH) return (a >= 0 && a < MAX_CH) ? &g_chU[a] : NULL;
     return (a >= 0 && a < MAX_MIX && b >= 0 && b < MAX_FX_SLOTS) ? &g_fxU[a][b] : NULL;
+}
+
+// A remote change moved this unit's saved state (param apply, channel name / color): take the
+// result as its new baseline shortly, without sending. Otherwise the next sweep sees the change,
+// takes it for a local edit (anyone using FL counts as input) and sends the whole unit back: a
+// full reload on the peer that can undo knob moves made there in the meantime.
+#define REBASE_REMOTE_MS 400
+static void unit_rebase_soon(int unit, int a, int b) {
+    Unit *u = unit_ptr(unit, a, b);
+    if (u) u->baselineAt = (GetTickCount() + REBASE_REMOTE_MS) | 1;
+}
+
+// A state load for this unit was queued. The poll thread must not take the params it moves for
+// local tweaks: they change while the (slow) load runs, before do_load opens its after-load
+// window (seen with Serum: hundreds of params "snapped back" against the incoming state).
+#define LOAD_PENDING_MS 15000
+static void unit_load_pending(int unit, int a, int b) {
+    Unit *u = unit_ptr(unit, a, b);
+    if (u) u->suppressUntil = GetTickCount() + LOAD_PENDING_MS;
 }
 
 // Unit a REC id belongs to (for activity tracking); returns 0 if none.
@@ -949,7 +1014,9 @@ static void do_snap(const QItem *it) {
     switch (it->mode) {
     case SNAP_IF_DIFF:
         if (u->hash && h != u->hash) {
-            if (userSince) send = 1;
+            plug_diff_log(it->unit, it->a, it->b, d, n);
+            if (u->baselineAt) logmsg("PLUG remote change absorbed unit=%s %d/%d", it->unit == U_CH ? "ch" : "fx", it->a, it->b);
+            else if (userSince) send = 1;
             else logmsg("PLUG drift absorbed unit=%s %d/%d (no local input)", it->unit == U_CH ? "ch" : "fx", it->a, it->b);
         }
         break;
@@ -975,7 +1042,7 @@ static void do_snap(const QItem *it) {
 static void do_load(const QItem *it) {
     Unit *u = unit_ptr(it->unit, it->a, it->b);
     void *obj = unit_obj(it->unit, it->a, it->b);
-    if (!u || !obj) { logmsg("LOAD: no target unit=%d %d/%d", it->unit, it->a, it->b); return; }
+    if (!u || !obj) { if (u) u->suppressUntil = GetTickCount(); logmsg("LOAD: no target unit=%d %d/%d", it->unit, it->a, it->b); return; }
     size_t n = 0;
     unsigned char *in = read_file(it->path, &n);
     uint64_t hin = in ? state_hash(in, n) : 0;
@@ -986,7 +1053,7 @@ static void do_load(const QItem *it) {
         unsigned char *own = unit_save(it->unit, it->a, it->b, &m);
         uint64_t hown = own ? state_hash(own, m) : 0;
         free(own);
-        if (hown && hown == hin) { u->hash = hown; return; }
+        if (hown && hown == hin) { u->hash = hown; u->suppressUntil = GetTickCount(); return; }
     }
     u->identAt = 0; u->lastAct = 0; u->burst = 0;
     wchar_t *w = dstr_new(it->path);
@@ -1385,6 +1452,7 @@ static unsigned char *notes_copy(int p, unsigned *n) {
 
 // Take the current note state of every pattern as already known (no sends).
 static void notes_rebaseline(void) {
+    notes_merge_reseed_all();
     int p;
     for (p = 1; p < MAX_PAT; p++) { g_patSeen[p] = g_patHash[p] = notes_hash(p); g_patChangedAt[p] = 0; }
     clips_rebaseline();          // audio clips reference channels: same structural events
@@ -1455,28 +1523,27 @@ static char *notes_json_item(int p, const unsigned char *d, unsigned n) {
 }
 
 static void do_notesnap(const QItem *it) {
+    if (g_notesMerge) { notes_merge_local(it->a); return; }   // merge mode: no locks, a delta
     int p = it->a;
     unsigned n;
     unsigned char *d = notes_copy(p, &n);
     uint64_t h = n ? notes_fnv(d, n) : 0;
     if (d) notes_clear_sel(d, n);
-    if (h != g_patHash[p]) {
-        char key[16];
-        sprintf_s(key, sizeof(key), "pat:%d", p);
-        if (!unit_before_send(key, 1, p, d, n)) { free(d); unit_revert(key); return; }
-        char *f = notes_json_item(p, d, n);
-        size_t cap = strlen(f) + 96;
-        char *m = (char *)malloc(cap);
-        sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"notes.set\",\"key\":\"%s\",%s}}", key, f);
-        ws_send(m);
-        free(m); free(f);
-        g_patHash[p] = h;
-        logmsg("NOTES sent pattern %d (%u notes)", p, n);
-    }
+    // per rack channel: lock, send, or put back what someone else is editing
+    if (h != g_patHash[p]) grp_local_change(1, p, d, n, 0);
     free(d);
 }
 
 static void do_notes(const QItem *it) {
+    if (it->unit == 3) { if (g_isLeader && g_notesMerge) notes_merge_send_full(it->a, 0); return; }   // a member asks
+    if (it->unit) {                               // merge mode: a delta (1) or the host's full state (2)
+        notes_merge_remote(it->a, (const unsigned char *)it->order, (unsigned)it->mode, it->unit == 2);
+        return;
+    }
+    if (it->b) {                                  // one rack channel's notes (notes.part)
+        grp_remote_apply(1, it->a, (unsigned)(it->b - 1), (const unsigned char *)it->order, (unsigned)it->mode);
+        return;
+    }
     if (g_patSeen[it->a] != g_patHash[it->a]) {   // our unsent edit is about to be replaced
         char key[16]; sprintf_s(key, sizeof(key), "pat:%d", it->a); hint_if_held(key);
     }
@@ -1498,6 +1565,7 @@ static void do_notesync(const QItem *it) {
 
 // Leader: every pattern that has notes (join / project load).
 static void send_notes_full(void) {
+    if (g_notesMerge) { notes_merge_send_all(); return; }
     size_t cap = 256, len;
     char *m = (char *)malloc(cap);
     int p, cnt = 0;
@@ -1596,6 +1664,15 @@ static DWORD    g_clipChangedAt = 0;
 static volatile DWORD g_clipSuppress = 0;
 static int      g_clipArr = -1;                  // arrangement the baseline belongs to
 
+// FL rewrites a clip's length (record +8) about half a second after the clip was added, on the
+// side that added it and on the side that received it. Length-only changes this soon after an apply
+// are FL finishing it: taken as agreed, never sent (else they echo back or revert real edits); a real
+// edit made in that moment still goes out (grp_local_change, fixup = 1).
+// Local clip edits settle longer than notes so that fixup travels with the edit (one send, not two).
+#define CLIP_REBASE_MS  1200
+#define CLIPS_SETTLE_MS 700
+static volatile DWORD g_clipRebaseUntil = 0;
+
 static int clip_cmp(const void *a, const void *b) { return memcmp(a, b, CLIP_SIZE); }
 
 static char *arr_clips(int arr) {
@@ -1667,7 +1744,12 @@ static unsigned char *clips_copy(int arr, unsigned *n) {
 static void playlist_refresh(void) {
     __try {
         void *form = **(void ***)(g_flBase + (PLFORM_VA - IMG_BASE));
-        if (form) ((formfn_t)(g_flBase + (PLREFRESH_VA - IMG_BASE)))(form);
+        if (form) {
+            HWND h = (HWND)(uintptr_t)*(uint32_t *)((char *)form + 0x45c);   // editor form window (ED_HWND)
+            ((formfn_t)(g_flBase + (PLREFRESH_VA - IMG_BASE)))(form);
+            // the refresh rebuilds FL's clip data but leaves the visible grid as it was: repaint it
+            if (h && IsWindow(h)) RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("CLIPS refresh faulted"); }
 }
 
@@ -1719,7 +1801,10 @@ static void clips_apply(int arr, const unsigned char *recs, unsigned n) {
     playlist_refresh();
     if (arr == g_clipArr) { g_clipSeen = g_clipHash = clips_hash(arr); g_clipChangedAt = 0; }
     g_clipSuppress = GetTickCount() + NOTES_SETTLE_MS;
+    g_clipRebaseUntil = GetTickCount() + CLIP_REBASE_MS;
 }
+
+static void clips_diff_log(const unsigned char *d, unsigned n);
 
 static void do_clipsnap(const QItem *it) {
     unsigned n;
@@ -1731,24 +1816,19 @@ static void do_clipsnap(const QItem *it) {
     hv = n ? clips_fnv(h, n) : 0;
     free(h);
     if (it->a == g_clipArr && hv != g_clipHash) {
-        char key[16];
-        for (i = 0; i < n; i++) d[(size_t)i * CLIP_SIZE + CLIP_SEL_OFS] &= (unsigned char)~CLIP_SEL_BIT;
-        sprintf_s(key, sizeof(key), "clips:%d", it->a);
-        if (!unit_before_send(key, 0, it->a, d, n)) { free(d); unit_revert(key); return; }
-        size_t cap = 96 + ((size_t)n * CLIP_SIZE + 2) / 3 * 4;
-        char *m = (char *)malloc(cap);
-        int o = sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"clips.set\",\"key\":\"%s\",\"arr\":%d,\"data\":\"", key, it->a);
-        b64enc(d ? d : (const unsigned char *)"", (int)(n * CLIP_SIZE), m + o);
-        strcat_s(m, cap, "\"}}");
-        ws_send(m);
-        free(m);
-        g_clipHash = hv;
-        logmsg("CLIPS sent arrangement %d (%u clips)", it->a, n);
+        // mode 1: FL finishing a remote apply (its length fixup is absorbed, real edits still go out)
+        clips_diff_log(d, n);
+        grp_local_change(0, it->a, d, n, it->mode == 1);
     }
+    (void)i;
     free(d);
 }
 
 static void do_clips(const QItem *it) {
+    if (it->b) {                                  // one playlist track's clips (clips.part)
+        grp_remote_apply(0, it->a, (unsigned)(it->b - 1), (const unsigned char *)it->order, (unsigned)it->mode);
+        return;
+    }
     if (it->a == g_clipArr && g_clipSeen != g_clipHash) {
         char key[16]; sprintf_s(key, sizeof(key), "clips:%d", it->a); hint_if_held(key);
     }
@@ -1774,12 +1854,48 @@ static void scan_clips(DWORD now) {
     if (arr != g_clipArr) { clips_rebaseline(); return; }       // switched arrangement: new baseline
     h = clips_hash(arr);
     if (h != g_clipSeen) { g_clipSeen = h; g_clipChangedAt = now; }
-    if (g_clipChangedAt && now - g_clipChangedAt >= NOTES_SETTLE_MS) {
+    if (g_clipChangedAt && (LONG)(now - g_clipRebaseUntil) < 0) {
+        g_clipChangedAt = 0;                                    // FL finishing a remote apply
+        if (g_clipSeen != g_clipHash) enqueue_unit(T_CLIPSNAP, 0, arr, 0, 1, NULL);
+    } else if (g_clipChangedAt && now - g_clipChangedAt >= CLIPS_SETTLE_MS) {
         // a new automation clip / audio clip channel: its chan.add must go out first
         if (chan_add_pending()) return;
         g_clipChangedAt = 0;
         if (g_clipSeen != g_clipHash && (LONG)(now - g_clipSuppress) >= 0) enqueue_unit(T_CLIPSNAP, 0, arr, 0, 0, NULL);
     }
+}
+
+// Inbound notes.part / clips.part (recv thread): {"pat"|"arr":i,"grp":g,"data":"<records of that group>"}
+static void on_part(const char *m, int isPat) {
+    const char *q = strstr(m, isPat ? "\"pat\":" : "\"arr\":"), *g = strstr(m, "\"grp\":"), *d = strstr(m, "\"data\":\""), *e;
+    size_t n;
+    int idx, grp;
+    if (!q || !g || !d) return;
+    idx = atoi(q + 6); grp = atoi(g + 6);
+    if (grp < 0 || grp > 0xFFFF || (isPat && (idx < 1 || idx >= MAX_PAT))) return;
+    d += 8;
+    if (!(e = strchr(d, '"'))) return;
+    unsigned char *recs = b64dec(d, (size_t)(e - d), &n);
+    QItem it; memset(&it, 0, sizeof(it));
+    it.type = isPat ? T_NOTES : T_CLIPS; it.a = idx; it.b = grp + 1;
+    it.mode = (int)(n / (isPat ? NOTE_SIZE : CLIP_SIZE)); it.order = (int *)recs;
+    enqueue(&it);
+}
+
+// Inbound notes.merge / notes.mergefull / notes.mergereq (recv thread): {"pat":p[,"data":"<packed>"]}
+static void on_notes_merge(const char *m) {
+    const char *q = strstr(m, "\"pat\":"), *d = strstr(m, "\"data\":\""), *e;
+    int pat;
+    size_t n = 0;
+    QItem it; memset(&it, 0, sizeof(it));
+    if (!q || (pat = atoi(q + 6)) < 1 || pat >= MAX_PAT) return;
+    it.type = T_NOTES; it.a = pat;
+    if (strstr(m, "\"kind\":\"notes.mergereq\"")) { it.unit = 3; enqueue(&it); return; }
+    if (!d || !(e = strchr(d + 8, '"'))) return;
+    it.order = (int *)b64dec(d + 8, (size_t)(e - d - 8), &n);
+    it.mode = (int)n;
+    it.unit = strstr(m, "\"kind\":\"notes.mergefull\"") ? 2 : 1;
+    enqueue(&it);
 }
 
 // Inbound clips.set (recv thread).
@@ -2307,6 +2423,7 @@ static void do_meta(const QItem *it) {
             vmt = *(void ***)o;
             if (name && !ustr_eq(*(wchar_t **)(o + CH_NAME), name)) ((chsetname_t)vmt[CH_SETNAME_VSLOT])(o, meta_name_arg(name));
             if (hasC && *(uint32_t *)(o + CH_COLOR) != color) ((chsetcolor_t)vmt[CH_SETCOLOR_VSLOT])(o, color);
+            unit_rebase_soon(U_CH, i, 0);       // name / color are part of the channel's saved state
             break; }
         case M_PAT: {
             char *r = pat_rec(i);
@@ -2484,10 +2601,12 @@ enum { NET_OFF, NET_CONNECTING, NET_ON, NET_ERR };
 #define BAR_H_REF       26         // bar height at FL's 41 px toolbar row; sizes below scale with it
 #define BTN_W_REF       88
 #define HOST_W_REF      60
+#define ROOMS_W_REF     66
 static HWND     g_netBar = NULL, g_netRow = NULL;
 static int      g_btnHover = 0, g_btnDown = 0, g_btnW = BTN_W_REF;   // hover / down: 1 Connect, 2 Host
 static int      g_btnX = 0;        // the button starts after the badge (bean + "flim v.YY.MM.DD")
 static int      g_hostX = 0, g_hostW = HOST_W_REF;
+static int      g_roomsX = 0, g_roomsW = ROOMS_W_REF;   // 3: Rooms (launches the separate Rooms app)
 static HWND     g_tip = NULL;      // tooltip over the timer
 static RECT     g_timerRc;         // where the timer was drawn (empty = none)
 
@@ -2547,13 +2666,14 @@ static int  g_alertInfo;           // ... shown as information, not a warning
 static volatile LONG g_hosting = 0;  // this connection hosts (vs joins)
 
 static int bar_host_shown(void) { int st = g_netState; return !(st == NET_ON || st == NET_CONNECTING); }
-// Which button is at x: 1 = Connect / Disconnect, 2 = Host, 0 = none.
+// Which button is at x: 1 = Connect / Disconnect, 2 = Host, 3 = Rooms, 0 = none.
 static int bar_btn_at(int x) {
     if (x >= g_btnX && x < g_btnX + g_btnW) return 1;
     if (bar_host_shown() && x >= g_hostX && x < g_hostX + g_hostW) return 2;
+    if (bar_host_shown() && x >= g_roomsX && x < g_roomsX + g_roomsW) return 3;
     return 0;
 }
-static int bar_btns_end(void) { return bar_host_shown() ? g_hostX + g_hostW : g_btnX + g_btnW; }
+static int bar_btns_end(void) { return bar_host_shown() ? g_roomsX + g_roomsW : g_btnX + g_btnW; }
 
 // Any thread: a message box on FL's main thread.
 static void net_alert_v(int info, const char *fmt, va_list ap) {
@@ -2635,8 +2755,8 @@ static void bar_paint(HWND h) {
     }
     {   // buttons
         int b, on = (st == NET_ON || st == NET_CONNECTING);
-        for (b = 1; b <= (on ? 1 : 2); b++) {
-            int r = H / 4, bx = b == 1 ? g_btnX : g_hostX, bw = b == 1 ? g_btnW : g_hostW;
+        for (b = 1; b <= (on ? 1 : 3); b++) {
+            int r = H / 4, bx = b == 1 ? g_btnX : b == 2 ? g_hostX : g_roomsX, bw = b == 1 ? g_btnW : b == 2 ? g_hostW : g_roomsW;
             COLORREF face = g_btnDown == b ? RGB(0x2e, 0x34, 0x38) : g_btnHover == b ? RGB(0x6a, 0x76, 0x7e) : RGB(0x5a, 0x64, 0x6b);
             HBRUSH fb = CreateSolidBrush(face);
             HPEN pen = CreatePen(PS_SOLID, 1, RGB(0x37, 0x3e, 0x43));
@@ -2646,7 +2766,7 @@ static void bar_paint(HWND h) {
             SelectObject(mem, ob); SelectObject(mem, op); DeleteObject(fb); DeleteObject(pen);
             SetTextColor(mem, RGB(0xee, 0xf1, 0xf3));
             if (g_btnDown == b) OffsetRect(&br, 0, 1);
-            DrawTextW(mem, b == 2 ? L"Host" : on ? L"Disconnect" : L"Connect", -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(mem, b == 3 ? L"Rooms" : b == 2 ? L"Host" : on ? L"Disconnect" : L"Connect", -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
     }
     {   // status dot + text
@@ -2711,6 +2831,14 @@ static void bar_layout(void) {
     }
     g_hostW = h * HOST_W_REF / BAR_H_REF;
     g_hostX = g_btnX + g_btnW + h / 4;
+    g_roomsW = h * ROOMS_W_REF / BAR_H_REF;
+    g_roomsX = g_hostX + g_hostW + h / 4;
+    if (g_tip) {                               // the Rooms button's tooltip follows the layout
+        TOOLINFOW ti; memset(&ti, 0, sizeof(ti));
+        ti.cbSize = TTTOOLINFOW_V2_SIZE; ti.hwnd = g_netBar; ti.uId = 2;
+        SetRect(&ti.rect, g_roomsX, 0, g_roomsX + g_roomsW, h);
+        SendMessageW(g_tip, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
+    }
     right = rr.right - 8; minX = rr.right / 2;
     spl = FindWindowExW(g_netRow, NULL, L"TQuickEditToolbarPanel", L"Splitter_1");
     if (spl && IsWindowVisible(spl)) {
@@ -2836,10 +2964,37 @@ static void random_pw(wchar_t *out, int n) {
 }
 
 // lp = 1: owner mode (Ctrl+click), also asks for the owner key = session 00.
+// The host dialog's (i) next to the note mode.
+static const wchar_t NOTE_MODE_HELP[] =
+    L"How notes combine when two people edit the same instrument in the same pattern at the same moment.\n\n"
+    L"Lock (default): whoever starts first edits it; the other person's change there is undone and FL's hint bar "
+    L"says who is editing. Predictable, and nothing builds up over a long session.\n\n"
+    L"Merge: both people's notes are kept. If you both drag the same note at the same moment, you can end up with "
+    L"two notes. Everyone needs a flim that can merge (older ones can't join).\n\n"
+    L"Different instruments never get in each other's way in either mode. Playlist clips always lock per track.";
+
 static INT_PTR CALLBACK host_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_INITDIALOG) {
         wchar_t v[512];
         g_dlgOwnerMode = (int)lp;
+        {   // note mode: Lock / Merge, remembered; (i) explains on hover and on click
+            HWND cb = GetDlgItem(dlg, IDC_HNOTEMODE), tip;
+            TOOLINFOW ti;
+            SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"Lock (one person at a time)");
+            SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"Merge (keep both people's notes)");
+            flimcfg_get(L"notes_mode", v, 512);
+            SendMessageW(cb, CB_SETCURSEL, wcscmp(v, L"merge") == 0 ? 1 : 0, 0);
+            tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, dlg, NULL, g_hinst, NULL);
+            if (tip) {
+                memset(&ti, 0, sizeof(ti));
+                ti.cbSize = sizeof(ti); ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS; ti.hwnd = dlg;
+                ti.uId = (UINT_PTR)GetDlgItem(dlg, IDC_HNOTEINFO); ti.lpszText = (LPWSTR)NOTE_MODE_HELP;
+                SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+                SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 360);
+                SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000);
+            }
+        }
         flimcfg_get(L"host_server", v, 512);
         SetDlgItemTextW(dlg, IDC_HSERVER, v[0] ? v : L"flim.fly.dev");
         random_pw(v, 8);
@@ -2903,7 +3058,13 @@ static INT_PTR CALLBACK host_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         }
         GetDlgItemTextW(dlg, IDC_HSERVER, w, 512);
         flimcfg_set(L"host_server", w);
+        InterlockedExchange(&g_hostMerge, SendDlgItemMessageW(dlg, IDC_HNOTEMODE, CB_GETCURSEL, 0, 0) == 1);
+        flimcfg_set(L"notes_mode", g_hostMerge ? L"merge" : L"lock");
         EndDialog(dlg, IDOK);
+        return TRUE;
+    }
+    if (m == WM_COMMAND && LOWORD(wp) == IDC_HNOTEINFO && HIWORD(wp) == STN_CLICKED) {
+        MessageBoxW(dlg, NOTE_MODE_HELP, L"flim - note editing", MB_OK | MB_ICONINFORMATION);
         return TRUE;
     }
     if (m == WM_COMMAND && LOWORD(wp) == IDCANCEL) { EndDialog(dlg, IDCANCEL); return TRUE; }
@@ -2982,6 +3143,67 @@ static void host_clicked(HWND h, int ownerMode) {
     }
 }
 
+// ---- Rooms: launches the separate flimrooms app (cashflowbeatz's Electron app, built from his source) ----
+static const wchar_t ROOMS_HELP[] =
+    L"Rooms (experimental, by cashflowbeatz)\n\n"
+    L"Opens the separate flimrooms app (its own download): create or join a room with your name and an 8-digit code. "
+    L"It starts its own FL Studio with its own flim and connects through cashflowbeatz's Cloudflare relay, "
+    L"so the projects and samples of Rooms sessions go through his server.\n\n"
+    L"Rooms sessions don't mix with Host / Connect sessions.";
+
+#define ROOMS_DOWNLOAD L"https://github.com/fckwader/flim/releases/latest"
+
+// The app: flim.ini rooms_app, else flim-rooms*.exe in rooms\ or next to this engine or in Downloads.
+static int rooms_find(wchar_t *out, int cap) {
+    wchar_t dir[MAX_PATH], pat[MAX_PATH], *s;
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+    flimcfg_get(L"rooms_app", out, cap);
+    if (out[0] && GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return 1;
+    GetModuleFileNameW(g_hinst, dir, MAX_PATH);
+    if ((s = wcsrchr(dir, L'\\')) != NULL) *s = 0;
+    {   // next to flim (rooms\ or the folder itself), or where downloads land
+        static const wchar_t *const where[] = { L"%s\\rooms", L"%s", NULL };
+        wchar_t dl[MAX_PATH], base[MAX_PATH];
+        int i;
+        for (i = 0; i < 3; i++) {
+            if (where[i]) swprintf_s(base, MAX_PATH, where[i], dir);
+            else if (!GetEnvironmentVariableW(L"USERPROFILE", dl, MAX_PATH)) break;
+            else swprintf_s(base, MAX_PATH, L"%s\\Downloads", dl);
+            swprintf_s(pat, MAX_PATH, L"%s\\flim-rooms*.exe", base);
+            if ((f = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
+                FindClose(f);
+                swprintf_s(out, cap, L"%s\\%s", base, fd.cFileName);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void rooms_clicked(HWND owner) {
+    wchar_t app[MAX_PATH] = L"";
+    HINSTANCE r;
+    if (!rooms_find(app, MAX_PATH)) {
+        OPENFILENAMEW ofn;
+        int a = MessageBoxW(g_mainForm ? g_mainForm : owner,
+            L"flimrooms is a separate download (flim-rooms-...-win64.exe on flim's GitHub releases page).\n\n"
+            L"Yes: open the download page\nNo: you already have it, show where it is",
+            L"flim - Rooms", MB_YESNOCANCEL | MB_ICONINFORMATION);
+        if (a == IDYES) { ShellExecuteW(NULL, L"open", ROOMS_DOWNLOAD, NULL, NULL, SW_SHOWNORMAL); return; }
+        if (a != IDNO) return;
+        memset(&ofn, 0, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = g_mainForm ? g_mainForm : owner;
+        ofn.lpstrFilter = L"flimrooms app (*.exe)\0*.exe\0"; ofn.lpstrFile = app; ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrTitle = L"flim - where is flimrooms?"; ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&ofn)) return;
+        flimcfg_set(L"rooms_app", app);
+    }
+    r = ShellExecuteW(g_mainForm ? g_mainForm : owner, L"open", app, NULL, NULL, SW_SHOWNORMAL);
+    logmsg("ROOMS launched %S (%d)", app, (int)(INT_PTR)r);
+    if ((INT_PTR)r <= 32) net_alert("Couldn't start flimrooms (error %d).", (int)(INT_PTR)r);
+}
+
 static LRESULT CALLBACK bar_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_PAINT: bar_paint(h); return 0;
@@ -3008,6 +3230,10 @@ static LRESULT CALLBACK bar_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_NOTIFY:
+        if (((NMHDR *)lp)->code == TTN_GETDISPINFOW && ((NMHDR *)lp)->idFrom == 2) {
+            ((NMTTDISPINFOW *)lp)->lpszText = (LPWSTR)(bar_host_shown() ? ROOMS_HELP : L"");
+            return 0;
+        }
         if (((NMHDR *)lp)->code == TTN_GETDISPINFOW) {
             int cool = !(g_netState == NET_ON && g_endsAt);
             ((NMTTDISPINFOW *)lp)->lpszText = (LPWSTR)(cool
@@ -3018,7 +3244,7 @@ static LRESULT CALLBACK bar_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         break;
     case WM_TIMER:
-        if (wp == CUR_TIMER) cursor_update();
+        if (wp == CUR_TIMER) { cursor_update(); glow_update(); }
         else {
             wchar_t tt[48];
             int cool, last;
@@ -3060,6 +3286,7 @@ static LRESULT CALLBACK bar_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             g_btnDown = 0; g_btnHover = 0; ReleaseCapture(); InvalidateRect(h, NULL, FALSE);
             if (PtInRect(&rc, p) && bar_btn_at(p.x) == b) {
                 if (b == 1) bar_clicked(h);
+                else if (b == 3) rooms_clicked(h);
                 else host_clicked(h, GetKeyState(VK_CONTROL) < 0);
             }
         }
@@ -3117,6 +3344,8 @@ static void ui_create(void) {
             memset(&ti, 0, sizeof(ti));
             ti.cbSize = TTTOOLINFOW_V2_SIZE; ti.uFlags = TTF_SUBCLASS; ti.hwnd = g_netBar; ti.uId = 1;
             ti.lpszText = LPSTR_TEXTCALLBACKW;
+            SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            ti.uId = 2;                        // the Rooms button (rect set by bar_layout)
             SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
             SendMessageW(g_tip, TTM_SETMAXTIPWIDTH, 0, 320);
             SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
@@ -3729,7 +3958,7 @@ static void do_patop(const QItem *it) {
 // reverted to the last agreed state and FL's hint bar says who is editing. A lock is released
 // ULOCK_IDLE_MS after its owner's last change. Params keep their own per-param locks.
 #define ULOCK_MAX      2048
-#define ULOCK_IDLE_MS  2000
+#define ULOCK_IDLE_MS  1000
 #define HINT_EVERY_MS  1500
 typedef struct {
     char  key[32];
@@ -3797,8 +4026,10 @@ static int plug_parse(const char *key, int *unit, int *a, int *b) {
 }
 
 static void unit_label(const char *key, char *out, int cap) {
-    int unit, a, b;
-    if (strncmp(key, "pat:", 4) == 0) sprintf_s(out, cap, "Pattern %d", atoi(key + 4));
+    int unit, a, b, g;
+    if (sscanf_s(key, "pat:%d:%d", &a, &g) == 2) sprintf_s(out, cap, "Channel %d in pattern %d", g + 1, a);
+    else if (sscanf_s(key, "clips:%d:%d", &a, &g) == 2) sprintf_s(out, cap, "Playlist track %d", 500 - g);
+    else if (strncmp(key, "pat:", 4) == 0) sprintf_s(out, cap, "Pattern %d", atoi(key + 4));
     else if (strncmp(key, "clips:", 6) == 0) strcpy_s(out, cap, "The playlist");
     else if (plug_parse(key, &unit, &a, &b)) {
         if (unit == U_FX) _snprintf_s(out, cap, _TRUNCATE, "Mixer insert %d slot %d", a, b + 1);
@@ -3882,7 +4113,12 @@ static void unit_revert(const char *key) {
     unsigned char *d = NULL;
     unsigned n = 0;
     int known = 0, idx = -1, isPat = strncmp(key, "pat:", 4) == 0;
-    int unit, a, b;
+    int unit, a, b, g;
+    if (sscanf_s(key, "pat:%d:%d", &a, &g) == 2 || sscanf_s(key, "clips:%d:%d", &a, &g) == 2) {
+        // one channel's notes / one track's clips: the holder's op for that group replaces ours here
+        logmsg("LOCK %s: our change lost the race; the holder's version replaces it", key);
+        return;
+    }
     if (plug_parse(key, &unit, &a, &b)) {
         // params were snapped back already (plug_undo); a state we sent was dropped by the server
         int sent = 0;
@@ -3989,9 +4225,33 @@ static UState *plug_last(int unit, int a, int b) {
     if (unit == U_CH) return (a >= 0 && a < MAX_CH) ? &g_plugLastCh[a] : NULL;
     return (a >= 0 && a < MAX_MIX && b >= 0 && b < MAX_FX_SLOTS) ? &g_plugLastFx[a][b] : NULL;
 }
-// Plugin param id -> its unit. 0 for channel/mixer basics (vol, pan, route...): those keep per-param locks.
+// Diagnostics: log how a unit's new state differs from its last agreed one. Main thread.
+static void plug_diff_log(int unit, int a, int b, const unsigned char *d, size_t n) {
+    char what[48];
+    unsigned char *old = NULL;
+    size_t on = 0;
+    EnterCriticalSection(&g_ulockLock);
+    UState *ls = plug_last(unit, a, b);
+    if (ls && ls->known && ls->n) { old = (unsigned char *)malloc(ls->n); memcpy(old, ls->d, ls->n); on = ls->n; }
+    LeaveCriticalSection(&g_ulockLock);
+    sprintf_s(what, sizeof(what), "%s %d/%d", unit == U_CH ? "ch" : "fx", a, b);
+    if (old) state_diff_log(what, old, on, d, n);
+    else logmsg("DIFF %s: no agreed state to compare", what);
+    free(old);
+}
+// Plugin param id -> its unit. 0 for channel/mixer basics (vol, pan, route...).
 static int plug_param_unit(uint32_t id, int *unit, int *a, int *b) {
     return !IS_MUTE_ID(id) && (id & 0xFFFF) >= REC_PLUG_FIRST && unit_of_id(id, unit, a, b);
+}
+// Someone else holds the plugin's lock (they are loading a preset / sending its state). key = its key.
+static int plug_held_by_peer(int unit, int a, int b, char *key, int cap) {
+    int r;
+    plug_key(unit, a, b, key, cap);
+    EnterCriticalSection(&g_ulockLock);
+    ULock *l = ulock_get(key, 0);
+    r = l && l->peer;
+    LeaveCriticalSection(&g_ulockLock);
+    return r;
 }
 
 // Last agreed state of a plugin (.fst bytes): set on baseline, send and remote apply. NULL clears.
@@ -4478,6 +4738,279 @@ static void cursor_update(void) {
     LeaveCriticalSection(&g_netTextLock);
 }
 
+// ---- what the others just changed: a glow in their color that fades out ----
+// Notes (piano roll) and clips (playlist) another person added or changed get a filled rectangle in
+// that person's color over our editor, fading from GLOW_ALPHA to nothing in GLOW_MS. One click-through
+// per-pixel-alpha window per editor, owned by FL's main form, sized to the editor's grid.
+#define GLOW_MS     1500
+#define GLOW_ALPHA  170
+#define GLOW_MAX    256
+typedef struct { int pl, ctx, x0, x1, y; COLORREF c; DWORD at; } Glow;   // x: ticks; y: key (pr) / track (pl)
+static Glow g_glow[GLOW_MAX];
+static int  g_nglow = 0;                    // guarded by g_netTextLock
+static HWND g_glowWnd[2];
+static char g_lastFrom[64];                 // who sent the op being applied (recv thread)
+
+// Recv thread: remember the sender of the op that is about to be queued.
+static void glow_note_sender(const char *m) {
+    const char *f = strstr(m, "\"from\":\"");
+    int i = 0;
+    if (f) for (f += 8; f[i] && f[i] != '"' && i < (int)sizeof(g_lastFrom) - 1; i++) g_lastFrom[i] = f[i];
+    g_lastFrom[i] = 0;
+}
+
+static void glow_add(int pl, int ctx, int x0, int x1, int y, const char *from) {
+    DWORD now = GetTickCount();
+    int i, k = -1;
+    EnterCriticalSection(&g_netTextLock);
+    for (i = 0; i < g_nglow; i++) if (now - g_glow[i].at >= GLOW_MS) { k = i; break; }   // reuse an expired one
+    if (k < 0 && g_nglow < GLOW_MAX) k = g_nglow++;
+    if (k >= 0) {
+        Glow *g = &g_glow[k];
+        g->pl = pl; g->ctx = ctx; g->x0 = x0; g->x1 = x1 > x0 ? x1 : x0 + 1; g->y = y;
+        g->c = cursor_color(from && from[0] ? from : "?"); g->at = now;
+    }
+    LeaveCriticalSection(&g_netTextLock);
+}
+
+// Main thread: the records of a group that are new / changed after a remote apply glow.
+// old/now: grp_sorted lists of that group before and after (records of other groups are skipped).
+static void glow_changed(int isPat, int idx, unsigned grp, const unsigned char *old, unsigned no, const unsigned char *now, unsigned nn) {
+    size_t sz = isPat ? NOTE_SIZE : CLIP_SIZE;
+    unsigned i, j;
+    for (i = 0; i < nn; i++) {
+        const unsigned char *r = now + i * sz;
+        int seen = 0;
+        if (grp_of(r, isPat) != grp) continue;
+        for (j = 0; j < no && !seen; j++) seen = rec_cmp(old + j * sz, r, sz) == 0;
+        if (seen) continue;
+        {
+            int pos = *(const int32_t *)r, len = *(const int32_t *)(r + 8);
+            if (len <= 0) len = 96;
+            if (isPat) glow_add(0, idx, pos, pos + len, *(const uint16_t *)(r + 12), g_lastFrom);
+            else glow_add(1, idx, pos, pos + len, 500 - (int)*(const uint16_t *)(r + CLIP_GRP_OFS), g_lastFrom);
+        }
+    }
+}
+
+static HWND glow_window(int pl) {
+    static int reg = 0;
+    if (!reg) {
+        WNDCLASSW wc; memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc = DefWindowProcW; wc.hInstance = g_hinst; wc.lpszClassName = L"FlimGlow";
+        RegisterClassW(&wc);
+        reg = 1;
+    }
+    if (!g_glowWnd[pl])
+        g_glowWnd[pl] = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"FlimGlow", L"",
+                                        WS_POPUP, 0, 0, 1, 1, g_mainForm, NULL, g_hinst, NULL);
+    return g_glowWnd[pl];
+}
+
+// Main thread (net bar timer): draw the live glows of one editor; hide its window when none.
+static void glow_paint(int pl, DWORD now) {
+    EdGeom g;
+    HWND w;
+    POINT org = { 0, 0 };
+    int i, any = 0, ctx = pl ? cur_arr() : cur_pat();
+    uint32_t *px;
+    BITMAPINFO bi;
+    HBITMAP bmp;
+    HDC sdc, mdc;
+    if (!g_glowWnd[pl] && !g_nglow) return;
+    EnterCriticalSection(&g_netTextLock);
+    for (i = 0; i < g_nglow; i++) if (g_glow[i].pl == pl && g_glow[i].ctx == ctx && now - g_glow[i].at < GLOW_MS) any = 1;
+    LeaveCriticalSection(&g_netTextLock);
+    if (!any || !ed_geom(pl, &g) || g_netState != NET_ON || IsIconic(g_mainForm)) {
+        if (g_glowWnd[pl] && IsWindowVisible(g_glowWnd[pl])) ShowWindow(g_glowWnd[pl], SW_HIDE);
+        return;
+    }
+    if (!(w = glow_window(pl))) return;
+    ClientToScreen(g.h, &org);
+    org.x += g.L; org.y += g.T;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = g.W; bi.bmiHeader.biHeight = -g.H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    sdc = GetDC(NULL);
+    mdc = CreateCompatibleDC(sdc);
+    bmp = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+    if (!bmp) { DeleteDC(mdc); ReleaseDC(NULL, sdc); return; }
+    memset(px, 0, (size_t)g.W * g.H * 4);
+    EnterCriticalSection(&g_netTextLock);
+    for (i = 0; i < g_nglow; i++) {
+        Glow *e = &g_glow[i];
+        int x0, x1, y0, y1, x, y, a;
+        if (e->pl != pl || e->ctx != ctx || now - e->at >= GLOW_MS) continue;
+        a = GLOW_ALPHA * (int)(GLOW_MS - (now - e->at)) / GLOW_MS;
+        x0 = (int)(e->x0 / g.tpp) - g.hs; x1 = (int)(e->x1 / g.tpp) - g.hs;
+        if (!pl) { y0 = (int)(((double)g.topkey - e->y) * g.keyh) - g.vs; y1 = y0 + g.keyh; }
+        else { int top, h; if (!trk_rows(g.arr, e->y, &top, &h)) continue; y0 = top - g.vs; y1 = y0 + h; }
+        if (x1 - x0 < 3) x1 = x0 + 3;
+        if (!g_curNoCover) {                      // under a plugin window etc.: not drawn there
+            POINT c = { (x0 + x1) / 2 + g.L, (y0 + y1) / 2 + g.T };
+            HWND hw;
+            ClientToScreen(g.h, &c);
+            hw = WindowFromPoint(c);
+            if (hw != g.h && !IsChild(g.h, hw)) continue;
+        }
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > g.W) x1 = g.W;
+        if (y1 > g.H) y1 = g.H;
+        for (y = y0; y < y1; y++)
+            for (x = x0; x < x1; x++) {
+                uint32_t *p = &px[(size_t)y * g.W + x];
+                int edge = y == y0 || y == y1 - 1 || x == x0 || x == x1 - 1, aa = edge ? (a * 3 / 2 > 255 ? 255 : a * 3 / 2) : a;
+                if ((int)(*p >> 24) >= aa) continue;
+                // premultiplied BGRA
+                *p = ((uint32_t)aa << 24) | ((uint32_t)(GetRValue(e->c) * aa / 255) << 16) |
+                     ((uint32_t)(GetGValue(e->c) * aa / 255) << 8) | (uint32_t)(GetBValue(e->c) * aa / 255);
+            }
+    }
+    LeaveCriticalSection(&g_netTextLock);
+    {
+        HGDIOBJ ob = SelectObject(mdc, bmp);
+        SIZE sz = { g.W, g.H };
+        POINT src = { 0, 0 };
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        UpdateLayeredWindow(w, sdc, &org, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
+        SelectObject(mdc, ob);
+        if (!IsWindowVisible(w)) ShowWindow(w, SW_SHOWNOACTIVATE);
+        SetWindowPos(w, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    DeleteObject(bmp);
+    DeleteDC(mdc);
+    ReleaseDC(NULL, sdc);
+}
+
+// Knobs: FL draws most of them itself (mixer strips, channel rack rows) and a plugin's own editor is
+// opaque to FL, so a knob someone else turned lights up the window it is in instead: that channel's
+// plugin / settings window or that effect's window when open, else the channel rack / mixer.
+// A frame plus a light tint in their color, fading like the notes. Main thread only.
+#define FRAME_MAX   8
+#define CHAN_FORM   0xb8          // channel / mixer slot object: its plugin window (TPluginForm)
+typedef struct { HWND target, ov; COLORREF c; DWORD at; } FrameGlow;
+static FrameGlow g_frame[FRAME_MAX];
+
+static HWND form_hwnd(void *obj) {
+    HWND h = NULL;
+    if (!obj) return NULL;
+    __try {
+        char *form = *(char **)((char *)obj + CHAN_FORM);
+        if (form) h = (HWND)(uintptr_t)*(uint32_t *)(form + ED_HWND);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return NULL; }
+    return h && IsWindow(h) && wnd_class_is(h, "TPluginForm") && IsWindowVisible(h) ? h : NULL;
+}
+static BOOL CALLBACK find_form_cb(HWND h, LPARAM lp) {
+    void **a = (void **)lp;
+    if (IsWindowVisible(h) && wnd_class_is(h, (const char *)a[0])) { a[1] = h; return FALSE; }
+    return TRUE;
+}
+static HWND find_form(const char *cls) {
+    void *a[2];
+    a[0] = (void *)cls; a[1] = NULL;
+    if (g_mainForm) EnumChildWindows(g_mainForm, find_form_cb, (LPARAM)a);
+    return (HWND)a[1];
+}
+
+static void glow_param(uint32_t id, COLORREF c) {
+    HWND h = NULL;
+    int i, k = -1;
+    DWORD now = GetTickCount();
+    if (IS_MUTE_ID(id) || (id >= 0x40000000u && id < 0x70000000u)) return;   // mute bits, tempo etc.
+    if (id < 0x40000000u) {
+        h = form_hwnd(chan_obj((int)(id >> 16)));
+        if (!h && (id & 0xFFFF) < REC_PLUG_FIRST) h = find_form("TStepSeqForm");
+    } else {
+        int un, t, sl;
+        if (unit_of_id(id, &un, &t, &sl)) h = form_hwnd(fx_obj(t, sl));
+        if (!h) h = find_form("TFXForm");
+    }
+    if (!h) return;
+    for (i = 0; i < FRAME_MAX; i++) if (g_frame[i].target == h) { k = i; break; }
+    if (k < 0) for (i = 0; i < FRAME_MAX; i++) if (!g_frame[i].target || now - g_frame[i].at >= GLOW_MS) { k = i; break; }
+    if (k < 0) return;
+    g_frame[k].target = h; g_frame[k].c = c; g_frame[k].at = now;
+}
+
+static void frame_paint(FrameGlow *f, DWORD now) {
+    RECT r, o;
+    POINT org;
+    SIZE sz;
+    uint32_t *px;
+    BITMAPINFO bi;
+    HBITMAP bmp;
+    HDC sdc, mdc;
+    HWND above, lvl;
+    int W, H, x, y, a;
+    if (!f->target) return;
+    if (now - f->at >= GLOW_MS || !IsWindow(f->target) || !IsWindowVisible(f->target) || g_netState != NET_ON ||
+        IsIconic(g_mainForm) || !GetWindowRect(f->target, &r)) {
+        if (f->ov && IsWindowVisible(f->ov)) ShowWindow(f->ov, SW_HIDE);
+        if (now - f->at >= GLOW_MS) f->target = NULL;
+        return;
+    }
+    W = r.right - r.left; H = r.bottom - r.top;
+    if (W <= 0 || H <= 0) return;
+    if (!g_curNoCover) {                          // FL behind another app: not drawn
+        POINT c = { (r.left + r.right) / 2, r.top + 8 };
+        DWORD pid = 0;
+        GetWindowThreadProcessId(WindowFromPoint(c), &pid);
+        if (pid != GetCurrentProcessId()) { if (f->ov && IsWindowVisible(f->ov)) ShowWindow(f->ov, SW_HIDE); return; }
+    }
+    if (!f->ov) {
+        glow_window(0);                           // registers the class
+        f->ov = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"FlimGlow", L"",
+                                WS_POPUP, 0, 0, 1, 1, g_mainForm, NULL, g_hinst, NULL);
+        if (!f->ov) return;
+    }
+    a = GLOW_ALPHA * (int)(GLOW_MS - (now - f->at)) / GLOW_MS;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    sdc = GetDC(NULL);
+    mdc = CreateCompatibleDC(sdc);
+    bmp = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+    if (!bmp) { DeleteDC(mdc); ReleaseDC(NULL, sdc); return; }
+    for (y = 0; y < H; y++)
+        for (x = 0; x < W; x++) {
+            int edge = x < 3 || y < 3 || x >= W - 3 || y >= H - 3, aa = edge ? (a * 3 / 2 > 255 ? 255 : a * 3 / 2) : a / 5;
+            px[(size_t)y * W + x] = ((uint32_t)aa << 24) | ((uint32_t)(GetRValue(f->c) * aa / 255) << 16) |
+                                    ((uint32_t)(GetGValue(f->c) * aa / 255) << 8) | (uint32_t)(GetBValue(f->c) * aa / 255);
+        }
+    // not over windows on top of it: its siblings above it, then its parents' siblings, up to other apps
+    for (lvl = f->target; lvl && lvl != GetDesktopWindow(); lvl = GetAncestor(lvl, GA_PARENT))
+        for (above = GetWindow(lvl, GW_HWNDPREV); above; above = GetWindow(above, GW_HWNDPREV)) {
+            RECT ar;
+            int x0, y0, x1, y1;
+            if (!IsWindowVisible(above) || (GetWindowLongW(above, GWL_EXSTYLE) & WS_EX_TRANSPARENT) ||
+                !GetWindowRect(above, &ar) || !IntersectRect(&o, &ar, &r)) continue;
+            x0 = o.left - r.left; x1 = o.right - r.left; y0 = o.top - r.top; y1 = o.bottom - r.top;
+            for (y = y0; y < y1; y++) memset(&px[(size_t)y * W + x0], 0, (size_t)(x1 - x0) * 4);
+        }
+    {
+        HGDIOBJ ob = SelectObject(mdc, bmp);
+        POINT src = { 0, 0 };
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        org.x = r.left; org.y = r.top; sz.cx = W; sz.cy = H;
+        UpdateLayeredWindow(f->ov, sdc, &org, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
+        SelectObject(mdc, ob);
+        if (!IsWindowVisible(f->ov)) ShowWindow(f->ov, SW_SHOWNOACTIVATE);
+        SetWindowPos(f->ov, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    DeleteObject(bmp);
+    DeleteDC(mdc);
+    ReleaseDC(NULL, sdc);
+}
+
+static void glow_update(void) {
+    DWORD now = GetTickCount();
+    int i;
+    glow_paint(0, now);
+    glow_paint(1, now);
+    for (i = 0; i < FRAME_MAX; i++) frame_paint(&g_frame[i], now);
+}
+
 // Hooks for the notes / clips code ------------------------------------------------------
 // Local change of a unit about to be sent (main thread). d = the records being sent.
 // Returns 0 if someone else holds the unit: the caller reverts instead of sending.
@@ -4522,6 +5055,442 @@ static void units_capture_all(void) {
         g_clipLastArr = arr;
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_clipLast.known = 0; }
     LeaveCriticalSection(&g_ulockLock);
+}
+
+// Diagnostics: which record offsets differ between the clips about to be sent and the last
+// agreed list (both masked + sorted like the hash). Main thread.
+static void clips_diff_log(const unsigned char *d, unsigned n) {
+    unsigned char *a = NULL, *b = NULL;
+    unsigned na = 0, i, k;
+    unsigned char off[CLIP_SIZE] = { 0 };
+    char line[400];
+    int o, any = 0;
+    EnterCriticalSection(&g_ulockLock);
+    if (g_clipLast.known && g_clipLast.n) { na = g_clipLast.n; a = (unsigned char *)malloc((size_t)na * CLIP_SIZE); memcpy(a, g_clipLast.d, (size_t)na * CLIP_SIZE); }
+    LeaveCriticalSection(&g_ulockLock);
+    o = sprintf_s(line, sizeof(line), "DIFF clips %u -> %u:", na, n);
+    if (a && na == n && n) {
+        b = (unsigned char *)malloc((size_t)n * CLIP_SIZE);
+        memcpy(b, d, (size_t)n * CLIP_SIZE);
+        clips_fnv(a, na); clips_fnv(b, n);                 // mask + sort both the same way
+        for (i = 0; i < n; i++)
+            for (k = 0; k < CLIP_SIZE; k++)
+                if (a[(size_t)i * CLIP_SIZE + k] != b[(size_t)i * CLIP_SIZE + k]) off[k] = 1;
+        for (k = 0; k < CLIP_SIZE && o < (int)sizeof(line) - 8; k++)
+            if (off[k]) { o += sprintf_s(line + o, sizeof(line) - o, " %02x", k); any = 1; }
+        if (!any) sprintf_s(line + o, sizeof(line) - o, " identical");
+    }
+    logmsg("%s", line);
+    free(a); free(b);
+}
+
+// ---- finer units: a pattern's notes per rack channel, an arrangement's clips per playlist track ----
+// Two people writing different instruments of one pattern (or on different playlist tracks) don't
+// collide: a change locks, sends and replaces only its group ("pat:<p>:<channel>",
+// "clips:<arr>:<track field>"); a remote group replaces only that group here, and unsent local edits
+// in other groups are kept and sent. Groups: note record +6 (rack channel), clip record +12 (track).
+#define GRP_MAX      512
+static int g_grpOfs, g_grpSize;                 // qsort context (main thread only)
+
+static unsigned grp_of(const unsigned char *r, int isPat) { return *(const uint16_t *)(r + (isPat ? NOTE_GRP_OFS : CLIP_GRP_OFS)); }
+
+// Record order / equality ignoring a clip's per-instance id (FL's own numbering, differs per side).
+static int rec_cmp(const void *x, const void *y, size_t sz) {
+    int r;
+    if (sz != CLIP_SIZE) return memcmp(x, y, sz);
+    if ((r = memcmp(x, y, CLIP_ID_OFS)) != 0) return r;
+    return memcmp((const char *)x + CLIP_ID_OFS + 4, (const char *)y + CLIP_ID_OFS + 4, sz - CLIP_ID_OFS - 4);
+}
+
+static int grp_cmp(const void *x, const void *y) {
+    uint16_t a = *(const uint16_t *)((const char *)x + g_grpOfs), b = *(const uint16_t *)((const char *)y + g_grpOfs);
+    if (a != b) return a < b ? -1 : 1;
+    return rec_cmp(x, y, (size_t)g_grpSize);
+}
+
+// Copy without selection bits, sorted by group, then bytes (clip ids kept: FL needs them; compares skip them). NULL if n == 0.
+static unsigned char *grp_sorted(const unsigned char *d, unsigned n, int isPat) {
+    size_t sz = isPat ? NOTE_SIZE : CLIP_SIZE;
+    unsigned i;
+    unsigned char *c;
+    if (!n || !d) return NULL;
+    c = (unsigned char *)malloc((size_t)n * sz);
+    memcpy(c, d, (size_t)n * sz);
+    for (i = 0; i < n; i++) {
+        unsigned char *r = c + (size_t)i * sz;
+        if (isPat) r[NOTE_SEL_OFS] &= (unsigned char)~NOTE_SEL_BIT;
+        else r[CLIP_SEL_OFS] &= (unsigned char)~CLIP_SEL_BIT;
+    }
+    g_grpOfs = isPat ? NOTE_GRP_OFS : CLIP_GRP_OFS; g_grpSize = (int)sz;
+    qsort(c, n, sz, grp_cmp);
+    return c;
+}
+
+// Groups whose records differ between two grp_sorted lists.
+static int grp_changed(const unsigned char *L, unsigned nl, const unsigned char *G, unsigned ng, int isPat, uint16_t *out, int cap) {
+    size_t sz = isPat ? NOTE_SIZE : CLIP_SIZE;
+    unsigned i = 0, j = 0;
+    int k = 0;
+    while (i < nl || j < ng) {
+        unsigned gl = i < nl ? grp_of(L + i * sz, isPat) : 0x10000, gg = j < ng ? grp_of(G + j * sz, isPat) : 0x10000;
+        unsigned g = gl < gg ? gl : gg, i2 = i, j2 = j;
+        while (i2 < nl && grp_of(L + i2 * sz, isPat) == g) i2++;
+        while (j2 < ng && grp_of(G + j2 * sz, isPat) == g) j2++;
+        int diff = i2 - i != j2 - j;
+        unsigned q;
+        for (q = 0; !diff && q < i2 - i; q++) diff = rec_cmp(L + (i + q) * sz, G + (j + q) * sz, sz) != 0;
+        if (diff && k < cap) out[k++] = (uint16_t)g;
+        i = i2; j = j2;
+    }
+    return k;
+}
+
+static int grp_in(unsigned g, const uint16_t *s, int n) { int i; for (i = 0; i < n; i++) if (s[i] == g) return 1; return 0; }
+
+// Append the records of src whose group is (in = 1) / is not (in = 0) in s to *dst (realloc'd).
+static void grp_take(unsigned char **dst, unsigned *nd, const unsigned char *src, unsigned n, int isPat, const uint16_t *s, int ns, int in) {
+    size_t sz = isPat ? NOTE_SIZE : CLIP_SIZE;
+    unsigned i;
+    for (i = 0; i < n; i++) {
+        const unsigned char *r = src + (size_t)i * sz;
+        if (grp_in(grp_of(r, isPat), s, ns) != in) continue;
+        *dst = (unsigned char *)realloc(*dst, (size_t)(*nd + 1) * sz);
+        memcpy(*dst + (size_t)*nd * sz, r, sz);
+        (*nd)++;
+    }
+}
+
+// The user's last click / key went to the playlist, recently.
+#define PL_INPUT_RECENT_MS 3000
+static int user_in_playlist(void) {
+    HWND h = g_focusHwnd;
+    wchar_t t[64];
+    if (!g_lastInput || GetTickCount() - g_lastInput > PL_INPUT_RECENT_MS) return 0;
+    while (h && h != g_mainForm && !is_fl_form(h)) h = GetParent(h);
+    if (!h || h == g_mainForm) return 0;
+    InternalGetWindowText(h, t, 64);
+    return wcsstr(t, L"Playlist") != NULL;
+}
+
+// Clip groups that changed only in their length field (+8): FL stretches the clips of a pattern
+// when the pattern grows (a note past its end), on every side at once. Not an edit unless the user
+// is working in the playlist: those groups are dropped from ch[] (they become agreed as they are).
+static int clips_drop_derived(const unsigned char *L, unsigned nl, const unsigned char *G, unsigned ng, uint16_t *ch, int nc) {
+    unsigned char *l2 = NULL, *g2 = NULL;
+    unsigned i;
+    uint16_t real[GRP_MAX];
+    int nr, k, o = 0;
+    if (nl) { l2 = (unsigned char *)malloc((size_t)nl * CLIP_SIZE); memcpy(l2, L, (size_t)nl * CLIP_SIZE); }
+    if (ng) { g2 = (unsigned char *)malloc((size_t)ng * CLIP_SIZE); memcpy(g2, G, (size_t)ng * CLIP_SIZE); }
+    for (i = 0; i < nl; i++) memset(l2 + (size_t)i * CLIP_SIZE + 8, 0, 4);
+    for (i = 0; i < ng; i++) memset(g2 + (size_t)i * CLIP_SIZE + 8, 0, 4);
+    g_grpOfs = CLIP_GRP_OFS; g_grpSize = CLIP_SIZE;
+    if (nl) qsort(l2, nl, CLIP_SIZE, grp_cmp);
+    if (ng) qsort(g2, ng, CLIP_SIZE, grp_cmp);
+    nr = grp_changed(l2, nl, g2, ng, 0, real, GRP_MAX);
+    for (k = 0; k < nc; k++)
+        if (grp_in(ch[k], real, nr)) ch[o++] = ch[k];
+        else logmsg("CLIPS track group %u: only clip lengths moved (pattern grew), not sent", ch[k]);
+    free(l2); free(g2);
+    return o;
+}
+
+static void grp_key(char *key, int cap, int isPat, int idx, unsigned g) {
+    if (isPat) sprintf_s(key, cap, "pat:%d:%u", idx, g); else sprintf_s(key, cap, "clips:%d:%u", idx, g);
+}
+
+static unsigned char *agreed_copy(int isPat, int idx, unsigned *n) {
+    unsigned char *d = NULL;
+    size_t sz = isPat ? NOTE_SIZE : CLIP_SIZE;
+    UState *s = isPat ? &g_patLast[idx] : &g_clipLast;
+    *n = 0;
+    EnterCriticalSection(&g_ulockLock);
+    if (s->known && s->n && (isPat || g_clipLastArr == idx)) { *n = s->n; d = (unsigned char *)malloc((size_t)s->n * sz); memcpy(d, s->d, (size_t)s->n * sz); }
+    LeaveCriticalSection(&g_ulockLock);
+    return d;
+}
+
+static uint64_t grp_hash(unsigned char *d, unsigned n, int isPat) {
+    if (!n) return 0;
+    if (isPat) return notes_fnv(d, n);
+    return clips_fnv(d, n);                       // sorts d in place (fine: a private copy)
+}
+
+// Main thread: our pattern / arrangement changed (cur = FL's records now). Sends each changed group
+// under its own lock; groups someone else holds are put back to the agreed state.
+// fixup = 1: right after a remote apply (FL finishing it): length-only changes are absorbed even while
+// the user works in the playlist; real edits made in that moment still go out.
+static void grp_local_change(int isPat, int idx, const unsigned char *cur, unsigned n, int fixup) {
+    size_t sz = isPat ? NOTE_SIZE : CLIP_SIZE;
+    unsigned ng = 0, nm = 0, nagr = 0, i;
+    unsigned char *G = agreed_copy(isPat, idx, &ng);
+    unsigned char *Ls = grp_sorted(cur, n, isPat), *Gs = grp_sorted(G, ng, isPat), *agr = NULL;
+    uint16_t ch[GRP_MAX], held[GRP_MAX], sent[GRP_MAX];
+    int nc = grp_changed(Ls, n, Gs, ng, isPat, ch, GRP_MAX), nh = 0, ns = 0, k;
+    free(G);
+    uint16_t take[GRP_MAX];                       // groups whose local records become agreed
+    int nt = 0, nall = nc;
+    memcpy(take, ch, sizeof(uint16_t) * (size_t)nc);
+    if (!isPat && nc && (fixup || !user_in_playlist())) nc = clips_drop_derived(Ls, n, Gs, ng, ch, nc);
+    for (k = 0; k < nall; k++) if (!grp_in(take[k], ch, nc)) take[nt++] = take[k];   // derived: as they are
+    for (k = 0; k < nc; k++) {
+        char key[40];
+        int already;
+        grp_key(key, sizeof(key), isPat, idx, ch[k]);
+        if (ulock_local(key, &already)) sent[ns++] = ch[k]; else held[nh++] = ch[k];
+    }
+    for (k = 0; k < ns; k++) {                    // one op per group: the server checks its key
+        unsigned char *part = NULL;
+        unsigned np = 0;
+        char key[40], *m;
+        size_t cap;
+        int o;
+        grp_take(&part, &np, Ls, n, isPat, &sent[k], 1, 1);
+        grp_key(key, sizeof(key), isPat, idx, sent[k]);
+        cap = 160 + ((size_t)np * sz + 2) / 3 * 4;
+        m = (char *)malloc(cap);
+        o = sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"%s\",\"key\":\"%s\",\"%s\":%d,\"grp\":%u,\"data\":\"",
+                      isPat ? "notes.part" : "clips.part", key, isPat ? "pat" : "arr", idx, sent[k]);
+        b64enc(part ? part : (const unsigned char *)"", (int)(np * sz), m + o);
+        strcat_s(m, cap, "\"}}");
+        ws_send(m);
+        free(m); free(part);
+        logmsg("%s sent %s %d group %u (%u records)", isPat ? "NOTES" : "CLIPS", isPat ? "pattern" : "arrangement", idx, sent[k], np);
+    }
+    // agreed now: the agreed records of unchanged and held groups + ours of the groups we sent (or derived)
+    for (k = 0; k < ns; k++) take[nt++] = sent[k];
+    grp_take(&agr, &nagr, Gs, ng, isPat, take, nt, 0);
+    grp_take(&agr, &nagr, Ls, n, isPat, take, nt, 1);
+    EnterCriticalSection(&g_ulockLock);
+    if (isPat) ustate_set(&g_patLast[idx], agr, nagr, NOTE_SIZE);
+    else { ustate_set(&g_clipLast, agr, nagr, CLIP_SIZE); g_clipLastArr = idx; }
+    LeaveCriticalSection(&g_ulockLock);
+    if (nh) {
+        // someone else is editing these groups: ours go back to the agreed records
+        unsigned char *back = NULL;
+        unsigned nb = 0;
+        char key[40];
+        grp_take(&back, &nb, Ls, n, isPat, held, nh, 0);
+        grp_take(&back, &nb, Gs, ng, isPat, held, nh, 1);
+        if (isPat) notes_apply(idx, back, nb); else clips_apply(idx, back, nb);
+        EnterCriticalSection(&g_ulockLock);       // the apply stored "back" as agreed: put the real one back
+        if (isPat) ustate_set(&g_patLast[idx], agr, nagr, NOTE_SIZE);
+        else { ustate_set(&g_clipLast, agr, nagr, CLIP_SIZE); g_clipLastArr = idx; }
+        grp_key(key, sizeof(key), isPat, idx, held[0]);
+        ULock *l = ulock_get(key, 0);
+        if (l) hint_locked(l);
+        LeaveCriticalSection(&g_ulockLock);
+        logmsg("LOCK %s held by another user: local change reverted (%d group%s)", key, nh, nh > 1 ? "s" : "");
+        free(back);
+    }
+    {   // what is sent / agreed now is the new reference for the change scan
+        unsigned nn = 0;
+        unsigned char *now = isPat ? notes_copy(idx, &nn) : clips_copy(idx, &nn);
+        uint64_t h = grp_hash(now, nn, isPat);
+        if (isPat) g_patHash[idx] = h; else g_clipHash = h;
+        free(now);
+    }
+    free(Ls); free(Gs); free(agr);
+    (void)i; (void)nm;
+}
+
+// Main thread: a remote group arrived (recs = all its records). Replaces that group only.
+static void grp_remote_apply(int isPat, int idx, unsigned g, const unsigned char *recs, unsigned n) {
+    size_t sz = isPat ? NOTE_SIZE : CLIP_SIZE;
+    unsigned nc = 0, ng = 0, nm = 0, nagr = 0;
+    unsigned char *cur = isPat ? notes_copy(idx, &nc) : clips_copy(idx, &nc);
+    unsigned char *G = agreed_copy(isPat, idx, &ng);
+    unsigned char *Ls = grp_sorted(cur, nc, isPat), *Gs = grp_sorted(G, ng, isPat), *Rs = grp_sorted(recs, n, isPat);
+    unsigned char *merged = NULL, *agr = NULL;
+    uint16_t one = (uint16_t)g, ch[GRP_MAX];
+    int nch = grp_changed(Ls, nc, Gs, ng, isPat, ch, GRP_MAX);
+    char key[40];
+    free(cur); free(G);
+    grp_key(key, sizeof(key), isPat, idx, g);
+    if (grp_in(g, ch, nch)) hint_if_held(key);    // our unsent edit of this group is replaced
+    glow_changed(isPat, idx, g, Ls, nc, Rs, n);   // what they changed glows in their color
+    grp_take(&merged, &nm, Ls, nc, isPat, &one, 1, 0);
+    grp_take(&merged, &nm, Rs, n, isPat, &one, 1, 1);
+    grp_take(&agr, &nagr, Gs, ng, isPat, &one, 1, 0);
+    grp_take(&agr, &nagr, Rs, n, isPat, &one, 1, 1);
+    if (isPat) notes_apply(idx, merged, nm); else clips_apply(idx, merged, nm);
+    EnterCriticalSection(&g_ulockLock);
+    if (isPat) ustate_set(&g_patLast[idx], agr, nagr, NOTE_SIZE);
+    else { ustate_set(&g_clipLast, agr, nagr, CLIP_SIZE); g_clipLastArr = idx; }
+    LeaveCriticalSection(&g_ulockLock);
+    if (nch > (grp_in(g, ch, nch) ? 1 : 0)) {
+        // unsent local edits in other groups survived the merge: let the change scan send them
+        uint64_t h = grp_hash(agr, nagr, isPat);
+        if (isPat) { g_patHash[idx] = h; g_patChangedAt[idx] = GetTickCount(); }
+        else { g_clipHash = h; g_clipChangedAt = GetTickCount(); g_clipRebaseUntil = 0; }
+    }
+    logmsg("%s applied %s %d group %u (%u records, %u in all)", isPat ? "NOTES" : "CLIPS", isPat ? "pattern" : "arrangement", idx, g, n, nm);
+    free(Ls); free(Gs); free(Rs); free(merged); free(agr);
+}
+
+// ---- note merge mode (the host's choice; the server tells everyone in the welcome) ----
+// Instead of locking a pattern + channel, every note has an identity and both people's edits are
+// kept (flim_notes_crdt.h). A local edit goes out as a delta (new notes + observed removals,
+// "notes.merge"); a remote delta is merged after our own unsent edits got their identities. Each
+// pattern's state starts from a seed every side computes the same way from the same notes (scope =
+// hash of them). The host sends its full state on join; if a merge ever fails (different seed,
+// size cap), the host re-sends that pattern's full state to everyone ("notes.mergefull").
+static FncState g_fnc[MAX_PAT];
+static CRITICAL_SECTION g_fncLock;
+
+static int fnc_new_id(unsigned char out[16]) {
+    int i, nz = 0;
+    if (BCryptGenRandom(NULL, out, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return 0;
+    for (i = 0; i < 16; i++) nz |= out[i];
+    return nz != 0;
+}
+
+static void fnc_scope_of(const unsigned char *notes, unsigned n, unsigned char scope[16]) {
+    uint64_t a = fnv64(notes ? notes : (const unsigned char *)"", (size_t)n * NOTE_SIZE), b = fnv_add(a ^ 0x9e3779b97f4a7c15ull, "flim-notes", 10);
+    memcpy(scope, &a, 8); memcpy(scope + 8, &b, 8);
+}
+
+// Seed pattern p from these notes (selection bits cleared here). Caller holds g_fncLock.
+static int fnc_seed_notes(int p, const unsigned char *d, unsigned n) {
+    unsigned char *c = n ? (unsigned char *)malloc((size_t)n * NOTE_SIZE) : NULL, scope[16];
+    int r;
+    if (n) { memcpy(c, d, (size_t)n * NOTE_SIZE); notes_clear_sel(c, n); qsort(c, n, NOTE_SIZE, fnc_notecmp); }
+    fnc_scope_of(c, n, scope);
+    r = fnc_seed(&g_fnc[p], c, n, scope);
+    free(c);
+    return r;
+}
+
+// Everything known so far is the new seed (session start, project load, structural ops).
+static void notes_merge_reseed_all(void) {
+    int p;
+    if (!g_notesMerge) return;
+    EnterCriticalSection(&g_fncLock);
+    for (p = 1; p < MAX_PAT; p++) fnc_free(&g_fnc[p]);       // seeded again on first use, from the agreed notes
+    LeaveCriticalSection(&g_fncLock);
+}
+
+// Pattern p's state, seeded from its agreed notes if needed. Caller holds g_fncLock.
+static FncState *fnc_state(int p) {
+    if (!g_fnc[p].known) {
+        unsigned char *d = NULL;
+        unsigned n = 0;
+        EnterCriticalSection(&g_ulockLock);
+        if (g_patLast[p].known && g_patLast[p].n) { n = g_patLast[p].n; d = (unsigned char *)malloc((size_t)n * NOTE_SIZE); memcpy(d, g_patLast[p].d, (size_t)n * NOTE_SIZE); }
+        LeaveCriticalSection(&g_ulockLock);
+        fnc_seed_notes(p, d, n);
+        free(d);
+    }
+    return &g_fnc[p];
+}
+
+static void notes_merge_send(const char *kind, int p, const unsigned char *wire, unsigned bytes) {
+    size_t cap = 96 + ((size_t)bytes + 2) / 3 * 4;
+    char *m = (char *)malloc(cap);
+    int o = sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"%s\",\"pat\":%d,\"data\":\"", kind, p);
+    b64enc(wire, (int)bytes, m + o);
+    strcat_s(m, cap, "\"}}");
+    ws_send(m);
+    free(m);
+}
+
+// Host: (re)seed pattern p from what FL has now and send its whole state to everyone.
+static void notes_merge_send_full(int p, int reseed) {
+    unsigned n = 0, bytes = 0;
+    unsigned char *d = notes_copy(p, &n), *wire;
+    EnterCriticalSection(&g_fncLock);
+    if (reseed) fnc_seed_notes(p, d, n);
+    FncState *s = fnc_state(p);
+    wire = fnc_pack(s, s->entries, s->count, &bytes);
+    LeaveCriticalSection(&g_fncLock);
+    free(d);
+    if (wire) { notes_merge_send("notes.mergefull", p, wire, bytes); logmsg("NOTES merge: full state of pattern %d sent (%u bytes)", p, bytes); }
+    free(wire);
+}
+
+// Out of step: the host's state wins (members ask for it).
+static void notes_merge_repair(int p, const char *why) {
+    logmsg("NOTES merge: pattern %d out of step (%s): %s", p, why, g_isLeader ? "sending ours to everyone" : "asking the host");
+    if (g_isLeader) notes_merge_send_full(p, 1);
+    else { char m[96]; sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"notes.mergereq\",\"pat\":%d}}", p); ws_send(m); }
+}
+
+// Main thread: give our unsent edits of pattern p identities and send them. cur = FL's notes now.
+static void notes_merge_capture(int p, const unsigned char *cur, unsigned n) {
+    FncEntry *delta = NULL;
+    unsigned cnt = 0, bytes = 0;
+    unsigned char *wire = NULL;
+    int ok;
+    EnterCriticalSection(&g_fncLock);
+    FncState *s = fnc_state(p);
+    ok = fnc_capture(s, cur, n, fnc_new_id, &delta, &cnt, FNC_LIMIT);
+    if (ok && cnt) wire = fnc_pack(s, delta, cnt, &bytes);
+    LeaveCriticalSection(&g_fncLock);
+    if (!ok) { notes_merge_repair(p, "too many edits to track"); return; }
+    if (wire) { notes_merge_send("notes.merge", p, wire, bytes); logmsg("NOTES merge: sent pattern %d (%u changes)", p, cnt); }
+    free(delta); free(wire);
+}
+
+// Main thread: local change of pattern p (merge mode).
+static void notes_merge_local(int p) {
+    unsigned n = 0;
+    unsigned char *d = notes_copy(p, &n);
+    if (d) notes_clear_sel(d, n);
+    notes_merge_capture(p, d, n);
+    unit_agreed(1, p, d, n);
+    g_patHash[p] = n ? notes_fnv(d, n) : 0;
+    free(d);
+}
+
+// Main thread: a remote delta (full = 0) or the host's full state (full = 1) for pattern p.
+static void notes_merge_remote(int p, const unsigned char *wire, unsigned bytes, int full) {
+    unsigned char scope[16], *before = NULL, *after;
+    const FncEntry *in;
+    unsigned cnt, nb = 0, na = 0, i, j;
+    int ok;
+    if (!fnc_unpack(wire, bytes, scope, &in, &cnt)) { logmsg("NOTES merge: bad data for pattern %d", p); return; }
+    before = notes_copy(p, &nb);
+    if (before) notes_clear_sel(before, nb);
+    notes_merge_capture(p, before, nb);             // our unsent edits first get identities (and go out)
+    EnterCriticalSection(&g_fncLock);
+    if (full) {
+        FncState mine = g_fnc[p];                   // keep ours to merge our own edits back in
+        FncEntry *copy = cnt ? (FncEntry *)malloc((size_t)cnt * sizeof(FncEntry)) : NULL;
+        if (cnt) memcpy(copy, in, (size_t)cnt * sizeof(FncEntry));
+        memset(&g_fnc[p], 0, sizeof(FncState));
+        memcpy(g_fnc[p].scope, scope, 16); g_fnc[p].entries = copy; g_fnc[p].count = cnt; g_fnc[p].known = 1;
+        if (mine.known && memcmp(mine.scope, scope, 16) == 0) fnc_merge(&g_fnc[p], scope, mine.entries, mine.count);
+        fnc_free(&mine);
+        ok = 1;
+    } else ok = fnc_merge(fnc_state(p), scope, in, cnt);
+    after = ok ? fnc_materialize(&g_fnc[p], &na) : NULL;
+    LeaveCriticalSection(&g_fncLock);
+    if (!ok || na == UINT32_MAX) { free(before); free(after); notes_merge_repair(p, "merge failed"); return; }
+    notes_apply(p, after, na);
+    for (i = 0; i < na; i++) {                      // what they added glows
+        const unsigned char *r = after + (size_t)i * NOTE_SIZE;
+        int seen = 0;
+        for (j = 0; j < nb && !seen; j++) seen = memcmp(before + (size_t)j * NOTE_SIZE, r, NOTE_SIZE) == 0;
+        if (!seen) {
+            int pos = *(const int32_t *)r, len = *(const int32_t *)(r + 8);
+            glow_add(0, p, pos, pos + (len > 0 ? len : 96), *(const uint16_t *)(r + 12), g_lastFrom);
+        }
+    }
+    logmsg("NOTES merge: applied %s for pattern %d (%u notes now)", full ? "the host's full state" : "a change", p, na);
+    free(before); free(after);
+}
+
+// Host, join: every pattern's full state (patterns without notes start from the same empty seed).
+static void notes_merge_send_all(void) {
+    int p, cnt = 0;
+    for (p = 1; p < MAX_PAT; p++) {
+        int has;
+        EnterCriticalSection(&g_fncLock);
+        has = (g_fnc[p].known && g_fnc[p].count) || notes_hash(p);
+        LeaveCriticalSection(&g_fncLock);
+        if (has) { notes_merge_send_full(p, 0); cnt++; }
+    }
+    logmsg("NOTES merge: full state of %d patterns sent", cnt);
 }
 
 static void run_task(const QItem *it) {
@@ -4573,6 +5542,7 @@ static void drain_queue_mainthread(void) {
         LeaveCriticalSection(&g_qLock);
 
         if (g_projBusy && it.type != T_PROJLOAD && it.type != T_PROJDONE && it.type != T_PROJSNAP) {
+            if (it.type == T_LOAD) { Unit *u = unit_ptr(it.unit, it.a, it.b); if (u) u->suppressUntil = GetTickCount(); }
             if (it.type == T_LOAD || it.type == T_ADDCH) { if (it.path) { DeleteFileA(it.path); free(it.path); } }
             else if (it.type == T_UNITREVERT || it.type == T_PROJLOAD || it.type == T_HINT || it.type == T_META || it.type == T_PATOP) free(it.path);
             else if (it.type == T_ORDER || it.type == T_FXSYNC || it.type == T_NOTES || it.type == T_NOTESYNC || it.type == T_CLIPS) free(it.order);
@@ -4599,6 +5569,11 @@ static void drain_queue_mainthread(void) {
         }
         uint32_t r = write_value(it.id, it.v);
         if (s) InterlockedIncrement(&s->gen);
+        {
+            int un, ua, ub;
+            if (unit_of_id(it.id, &un, &ua, &ub)) unit_rebase_soon(un, ua, ub);
+        }
+        if (it.mode) glow_param(it.id, (COLORREF)(it.mode & 0xFFFFFF));
         logmsg("APPLY id=0x%08x v=%u ret=%u", it.id, it.v, r);
     }
     InterlockedExchange(&g_inHook, 0);
@@ -4701,6 +5676,31 @@ static uint32_t container_of(uint32_t id) {
 
 #define BULK_MIN_CHANGES    24
 #define BULK_MIN_CONTAINERS 4
+
+// Poll thread. A value that keeps changing (scrolling the tempo 130 -> 140, dragging a knob) goes
+// out at most once per PARAM_SEND_MS; the steps in between are dropped, never the newest value.
+static void param_send(Slot *s, const char *key, uint32_t v, DWORD now) {
+    char op[160];
+    sprintf_s(op, sizeof(op),
+        "{\"t\":\"op\",\"op\":{\"kind\":\"param.set\",\"key\":\"%s\",\"id\":%u,\"v\":%u}}", key, s->id, v);
+    ws_send(op);
+    s->lastSent = now;
+    s->sendPending = 0;
+}
+
+static void param_send_pending(Slot *s, DWORD now) {
+    char key[32];
+    int unit, a, b;
+    uint32_t v = s->last;
+    Unit *pu = plug_param_unit(s->id, &unit, &a, &b) ? unit_ptr(unit, a, b) : NULL;
+    if (pu && pu->burst) plug_key(unit, a, b, key, sizeof(key));
+    else {
+        if (s->lockedByPeer) { s->sendPending = 0; return; }   // lost it meanwhile: the holder's value wins
+        sprintf_s(key, sizeof(key), "param:%u", s->id);
+    }
+    param_send(s, key, v, now);
+    logmsg("DETECT id=0x%08x -> %u (sent, coalesced)", s->id, v);
+}
 
 typedef struct { Slot *s; uint32_t prev, v; } Change;
 static Change g_changes[MAX_SLOTS];
@@ -4814,6 +5814,8 @@ static DWORD WINAPI pollThread(LPVOID p) {
                 Unit *u = unit_of_id(s->id, &unit, &a, &b) ? unit_ptr(unit, a, b) : NULL;
                 if (u && now < u->suppressUntil) continue;   // caused by a remote state load
                 g_changes[nc].s = s; g_changes[nc].prev = prev; g_changes[nc].v = v; nc++;
+            } else if (s->sendPending && now - s->lastSent >= PARAM_SEND_MS) {
+                param_send_pending(s, now);                  // a coalesced change: its newest value
             }
             if (s->lockedByMe && now - s->lastTouch > LOCK_IDLE_MS) {
                 send_lock("lock_release", s->id);
@@ -4858,8 +5860,10 @@ static DWORD WINAPI pollThread(LPVOID p) {
             Slot *s = g_changes[i].s;
             char key[32];
             int unit, a, b;
-            if (plug_param_unit(s->id, &unit, &a, &b)) {
-                // plugin params go under their plugin's lock
+            Unit *pu = plug_param_unit(s->id, &unit, &a, &b) ? unit_ptr(unit, a, b) : NULL;
+            if (pu && (pu->burst || plug_held_by_peer(unit, a, b, key, sizeof(key)))) {
+                // a preset-sized change (or someone is replacing this plugin's whole state right
+                // now): under the plugin's lock, like the state that follows it
                 if (!plug_lock_param(unit, a, b, s, g_changes[i].prev, key, sizeof(key))) {
                     logmsg("LOCK %s held by another user: param 0x%08x snapped back", key, s->id);
                     enqueue_apply(s->id, g_changes[i].prev);
@@ -4867,6 +5871,8 @@ static DWORD WINAPI pollThread(LPVOID p) {
                     continue;
                 }
             } else {
+                // a knob (channel, mixer or plugin): its own lock; two people can turn different
+                // knobs of the same plugin at once
                 if (s->lockedByPeer) {
                     // someone else holds this knob: snap our local edit back
                     enqueue_apply(s->id, g_changes[i].prev);
@@ -4876,11 +5882,8 @@ static DWORD WINAPI pollThread(LPVOID p) {
                 s->lastTouch = now;
                 sprintf_s(key, sizeof(key), "param:%u", s->id);
             }
-            char op[160];
-            sprintf_s(op, sizeof(op),
-                "{\"t\":\"op\",\"op\":{\"kind\":\"param.set\",\"key\":\"%s\",\"id\":%u,\"v\":%u}}",
-                key, s->id, g_changes[i].v);
-            ws_send(op);
+            if (now - s->lastSent < PARAM_SEND_MS) { s->sendPending = 1; continue; }   // coalesced (e.g. a BPM scroll)
+            param_send(s, key, g_changes[i].v, now);
             logmsg("DETECT id=0x%08x %u -> %u (sent)", s->id, g_changes[i].prev, g_changes[i].v);
         }
         Sleep(POLL_MS);
@@ -4937,11 +5940,11 @@ static void pend_put(uint32_t id, uint32_t v) {
 
 // Apply an inbound value (queued for the main thread). onlyIfDiff skips values
 // we already have (join state). Returns 1 if an apply was queued.
-static int route_inbound(uint32_t id, uint32_t v, int onlyIfDiff) {
+static int route_inbound(uint32_t id, uint32_t v, int onlyIfDiff, int glow) {
     if (!add_slot(id)) { pend_put(id, v); return 0; }
     Slot *s = slot_by_id(id);
     if (onlyIfDiff && s && s->last == v) return 0;
-    enqueue_apply(id, v);
+    enqueue_apply_glow(id, v, glow);
     return 1;
 }
 
@@ -4971,7 +5974,7 @@ static void apply_full_state(const char *m) {
         uint32_t id = (uint32_t)strtoul(p + 1, &e, 10);
         if (*e != ',') break;
         uint32_t v = (uint32_t)strtoul(e + 1, &e, 10);
-        if (route_inbound(id, v, 1)) diff++;
+        if (route_inbound(id, v, 1, 0)) diff++;
         n++;
         p = e;
     }
@@ -5071,6 +6074,9 @@ static const struct { const char *code, *status, *alert; } k_netErrors[] = {
       "Too many wrong passwords from this computer.\n\nWait 10 minutes, then try again." },
     { "id_in_use", "Already in this session", "You are already in this session (from another FL?)." },
     { "session_full", "Session is full", "That session already has 8 people." },
+    { "data_limit", "Daily data limit reached",
+      "The server's daily data limit is used up (for everyone, or for your connection). "
+      "It resets at midnight UTC.\n\nTry again tomorrow." },
     { "too_many_connections", "Too many connections", "Too many flim connections from your network right now." },
     { "bad_request", "Bad session password", "The session password must be 1 to 128 characters." },
     { "idle", "Session closed: 5 minutes idle",
@@ -5138,8 +6144,18 @@ static void handle_msg(const char *m) {
         if (parse_unit(m, &unit, &a, &b, &path) && path) enqueue_unit(T_ADDCH, U_CH, a, 0, 0, path);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"chan.del\"")) {
         if (int_after(m, NULL, "\"ch\":", &a)) enqueue_unit(T_DELCH, U_CH, a, 0, 0, NULL);
+    } else if (strstr(m, "\"t\":\"op\"") && (strstr(m, "\"kind\":\"notes.merge\"") || strstr(m, "\"kind\":\"notes.mergefull\"") ||
+                                               strstr(m, "\"kind\":\"notes.mergereq\""))) {
+        glow_note_sender(m);
+        on_notes_merge(m);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"notes.set\"")) {
         parse_notes_item(strstr(m, "\"kind\":\"notes.set\""), NULL);
+    } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"notes.part\"")) {
+        glow_note_sender(m);
+        on_part(m, 1);
+    } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"clips.part\"")) {
+        glow_note_sender(m);
+        on_part(m, 0);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"clips.set\"")) {
         on_clips_set(m);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"meta.set\"")) {
@@ -5184,6 +6200,9 @@ static void handle_msg(const char *m) {
         // our own role is the first "role" field; later ones belong to the peers list
         const char *r = strstr(m, "\"role\":\"");
         g_isLeader = r && strncmp(r + 8, "leader", 6) == 0;
+        InterlockedExchange(&g_notesMerge, strstr(m, "\"notes\":\"merge\"") != NULL);   // the host's choice (old servers: locks)
+        notes_merge_reseed_all();
+        logmsg("NOTES this session %s simultaneous note edits", g_notesMerge ? "merges" : "locks per pattern + channel for");
         {   // our slot, and the session's key for the sample store
             const char *q = strstr(m, "\"session\":\""), *b = strstr(m, "\"blob\":\"");
             if (q && isdigit((unsigned char)q[11]) && isdigit((unsigned char)q[12]) && q[13] == '"') {
@@ -5203,7 +6222,10 @@ static void handle_msg(const char *m) {
         if (!g_isLeader) ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"state.req\"}}");
     } else if (strstr(m, "\"t\":\"op\"")) {
         if (strstr(m, "\"kind\":\"param.set\"") && jget_u32(m, "id", &id) && jget_u32(m, "v", &v)) {
-            route_inbound(id, v, 0);
+            char from[64]; const char *f = strstr(m, "\"from\":\""); int i = 0;
+            if (f) for (f += 8; f[i] && f[i] != '"' && i < (int)sizeof(from) - 1; i++) from[i] = f[i];
+            from[i] = 0;
+            route_inbound(id, v, 0, (int)(0x80000000u | cursor_color(from[0] ? from : "?")));
         }
     } else if ((strstr(m, "\"t\":\"lock\"") || strstr(m, "\"t\":\"lock_released\"")) && on_unit_lock(m)) {
         // pattern / playlist lock (mutexing)
@@ -5791,6 +6813,39 @@ static void samples_rewrite(unsigned char **d, size_t *n) {
     *n = c.n;
 }
 
+// ---- diagnostics: which events differ between two states of one unit ----
+#define DIFF_MAXEV 512
+typedef struct { int n; int id[DIFF_MAXEV]; const unsigned char *p[DIFF_MAXEV]; size_t len[DIFF_MAXEV]; } EvList;
+
+static int evlist_cb(void *ctx, int id, const unsigned char *p, size_t n, size_t at, size_t end) {
+    EvList *L = (EvList *)ctx;
+    (void)at; (void)end;
+    if (L->n >= DIFF_MAXEV) return 0;
+    L->id[L->n] = id; L->p[L->n] = p; L->len[L->n] = n; L->n++;
+    return 1;
+}
+
+// Main thread only (static lists).
+static void state_diff_log(const char *what, const unsigned char *a, size_t an, const unsigned char *b, size_t bn) {
+    static EvList A, B;
+    char line[700];
+    int o, i, shown = 0;
+    A.n = B.n = 0;
+    if (!flp_walk(a, an, evlist_cb, &A) || !flp_walk(b, bn, evlist_cb, &B)) { logmsg("DIFF %s: not FLP images", what); return; }
+    o = sprintf_s(line, sizeof(line), "DIFF %s (%zu -> %zu bytes, %d -> %d events):", what, an, bn, A.n, B.n);
+    for (i = 0; i < A.n && i < B.n && shown < 8 && o < (int)sizeof(line) - 80; i++) {
+        size_t k, m = A.len[i] < B.len[i] ? A.len[i] : B.len[i];
+        if (A.id[i] != B.id[i]) { o += sprintf_s(line + o, sizeof(line) - o, " #%d ev%d->ev%d (out of step)", i, A.id[i], B.id[i]); break; }
+        if (A.len[i] == B.len[i] && memcmp(A.p[i], B.p[i], m) == 0) continue;
+        for (k = 0; k < m && A.p[i][k] == B.p[i][k]; k++) {}
+        o += sprintf_s(line + o, sizeof(line) - o, " #%d ev%d len %zu->%zu @%zu %02x->%02x", i, A.id[i], A.len[i], B.len[i], k,
+                       k < A.len[i] ? A.p[i][k] : 0, k < B.len[i] ? B.p[i][k] : 0);
+        shown++;
+    }
+    if (!shown && A.n == B.n) o += sprintf_s(line + o, sizeof(line) - o, " events identical (header only)");
+    logmsg("%s", line);
+}
+
 // ---- same FL build for everyone ----
 // An older FL asks "continue loading anyway?" in the middle of loading a project or preset saved
 // by a newer FL (25.1: its own Yes / No / Get latest version box), and "Yes" there, inside a load
@@ -6352,13 +7407,13 @@ static DWORD WINAPI netThread(LPVOID p) {
     if (r->host) {
         json_esc(r->owner, own, sizeof(own));
         sprintf_s(hello, sizeof(hello),
-            "{\"t\":\"host\",\"password\":\"%s\"%s%s%s,\"user\":{\"id\":\"%s\",\"name\":\"%s\"}}",
-            pw, own[0] ? ",\"owner\":\"" : "", own, own[0] ? "\"" : "", g_myId, name);
+            "{\"t\":\"host\",\"password\":\"%s\"%s%s%s,\"notes\":\"%s\",\"user\":{\"id\":\"%s\",\"name\":\"%s\"}}",
+            pw, own[0] ? ",\"owner\":\"" : "", own, own[0] ? "\"" : "", g_hostMerge ? "merge" : "lock", g_myId, name);
         SecureZeroMemory(own, sizeof(own));
         logmsg("hosting on %s%s as %s (%s)", u.shown, r->owner[0] ? " (owner: session 00)" : "", g_myName, g_myId);
     } else {
         sprintf_s(hello, sizeof(hello),
-            "{\"t\":\"join\",\"session\":\"%s\",\"password\":\"%s\",\"user\":{\"id\":\"%s\",\"name\":\"%s\"}}",
+            "{\"t\":\"join\",\"session\":\"%s\",\"password\":\"%s\",\"caps\":[\"notes.merge\"],\"user\":{\"id\":\"%s\",\"name\":\"%s\"}}",
             sess, pw, g_myId, name);
         logmsg("joining session %s on %s as %s (%s)", sess, u.shown, g_myName, g_myId);
     }
@@ -6616,7 +7671,15 @@ static DWORD WINAPI engineMain(LPVOID p) {
             char own[256] = "", hv[8] = "";
             int host = GetEnvironmentVariableA("FLIM_HOST", hv, sizeof(hv)) > 0 && hv[0] == '1';
             GetEnvironmentVariableA("FLIM_PASSWORD", pw, sizeof(pw));
-            if (host) GetEnvironmentVariableA("FLIM_OWNER_KEY", own, sizeof(own));
+            // no FLIM_OWNER_KEY at all: the owner key saved in flim.ini (what the Host dialog fills in)
+            if (host && !GetEnvironmentVariableA("FLIM_OWNER_KEY", own, sizeof(own)) && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+                flimcfg_get_secret(L"owner_key", own, sizeof(own));
+            if (host) {   // note mode: FLIM_NOTES_MODE=merge|lock, else the host dialog's last choice
+                char nm[16] = "";
+                wchar_t wm[16] = L"";
+                if (GetEnvironmentVariableA("FLIM_NOTES_MODE", nm, sizeof(nm))) InterlockedExchange(&g_hostMerge, strcmp(nm, "merge") == 0);
+                else { flimcfg_get(L"notes_mode", wm, 16); InterlockedExchange(&g_hostMerge, wcscmp(wm, L"merge") == 0); }
+            }
             net_connect(env, pw, host, own);
             SecureZeroMemory(pw, sizeof(pw)); SecureZeroMemory(own, sizeof(own));
         }
@@ -6637,6 +7700,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         InitializeCriticalSection(&g_qLock);
         InitializeCriticalSection(&g_heldLock);
         InitializeCriticalSection(&g_ulockLock);
+    InitializeCriticalSection(&g_fncLock);
         InitializeCriticalSection(&g_netTextLock);
         InitializeCriticalSection(&g_sampleLock);
         InitializeCriticalSection(&g_outLock);

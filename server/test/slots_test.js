@@ -12,6 +12,9 @@ const servers = [
   { PORT: "8097", FLIM_PUBLIC: "1", FLIM_OWNER_KEY: "ownerk", FLIM_SESSION_MS: "3000", FLIM_COOLDOWN_MS: "4000", FLIM_MAX_CONNS_PER_IP: "500" },
   { PORT: "8096", FLIM_PASSWORD: "hk", FLIM_SESSION_MS: "1000", FLIM_IDLE_MS: "1000" },
   { PORT: "8095" },
+  { PORT: "8094", FLIM_PUBLIC: "1", FLIM_EGRESS_IP_DAY_GB: String(3000 / 2 ** 30), FLIM_BLOB_FILE_MAX: "1000",
+    FLIM_MAX_CONNS_PER_IP: "500" },
+  { PORT: "8093", FLIM_PUBLIC: "1", FLIM_MAX_CONNS_PER_IP: "500" },
 ].map((env, i) =>
   spawn(process.execPath, [path.join(__dirname, "..", "dist", "server.js")], {
     env: { ...process.env, FLIM_OWNER_KEY: "", FLIM_PASSWORD: "", ...env,
@@ -54,9 +57,9 @@ async function join(name, session, pw, id, base) {
   c.welcome = await c.wait((m) => m.t === "welcome" || m.t === "error");
   return c;
 }
-function req(method, path, key, body) {
+function req(method, path, key, body, port = 8099) {
   return new Promise((res) => {
-    const r = http.request({ host: "localhost", port: 8099, method, path, headers: { "x-flim-key": key, ...(body ? { "content-length": body.length } : {}) } },
+    const r = http.request({ host: "localhost", port, method, path, headers: { "x-flim-key": key, ...(body ? { "content-length": body.length } : {}) } },
       (resp) => { let d = ""; resp.on("data", (x) => (d += x)); resp.on("end", () => res({ status: resp.statusCode, body: d })); });
     if (body) r.write(body);
     r.end();
@@ -228,6 +231,45 @@ function req(method, path, key, body) {
     const Q = "ws://localhost:8095";
     const open = await host("O1", "op", undefined, Q);
     ok(open.welcome.session === "01", "self-hosted without password: anyone hosts 01");
+  }
+
+  // data budget + upload size (:8094: ~3000 bytes per IP per day, files up to 1000 bytes)
+  {
+    const D = "ws://localhost:8094";
+    const dh = await host("DH", "dp", undefined, D);
+    ok(dh.welcome.t === "welcome", "budget server: hosting works while under budget");
+    const big = Buffer.alloc(2000, 1), small = Buffer.alloc(900, 2);
+    const hb = crypto.createHash("sha256").update(big).digest("hex"), hs = crypto.createHash("sha256").update(small).digest("hex");
+    ok((await req("PUT", "/blob/" + hb, dh.welcome.blob, big, 8094)).status === 413, "file over the upload limit refused (413)");
+    ok((await req("PUT", "/blob/" + hs, dh.welcome.blob, small, 8094)).status === 201, "file under the limit stored");
+    let st = [];
+    for (let i = 0; i < 5; i++) st.push((await req("GET", "/blob/" + hs, dh.welcome.blob, undefined, 8094)).status);
+    ok(st.includes(200) && st[st.length - 1] === 429, "downloads refused once the IP's budget is used (" + st.join(",") + ")");
+    const dj = await join("DJ", dh.welcome.session, "dp", undefined, D);
+    ok(dj.welcome.code === "data_limit", "joining refused over budget (data_limit)");
+    ok(dh.closed === null, "the running session keeps going");
+  }
+
+  // note editing mode (:8093): the host picks lock (default) or merge; merge needs members that can merge
+  {
+    const N = "ws://localhost:8093";
+    const lh = await host("NL", "np", undefined, N);
+    ok(lh.welcome.t === "welcome" && lh.welcome.notes === "lock", "notes: lock by default");
+    ok((await join("NL2", lh.welcome.session, "np", undefined, N)).welcome.notes === "lock", "notes: lock session, plain member joins");
+    const mc = client("NM", N); await mc.open;
+    mc.send({ t: "host", user: mc.user, password: "mp", notes: "merge" });
+    mc.welcome = await mc.wait((m) => m.t === "welcome" || m.t === "error");
+    ok(mc.welcome.notes === "merge", "notes: host picks merge");
+    const old = await join("NO", mc.welcome.session, "mp", undefined, N);
+    ok(old.welcome.code === "notes_merge", "notes: merge session refuses a member that can't merge");
+    const nj = client("NJ", N); await nj.open;
+    nj.send({ t: "join", user: nj.user, session: mc.welcome.session, password: "mp", caps: ["notes.merge"] });
+    nj.welcome = await nj.wait((m) => m.t === "welcome" || m.t === "error");
+    ok(nj.welcome.t === "welcome" && nj.welcome.notes === "merge", "notes: merge-capable member joins and is told the mode");
+    const odd = client("NX", N); await odd.open;
+    odd.send({ t: "host", user: odd.user, password: "xp", notes: "nonsense" });
+    odd.welcome = await odd.wait((m) => m.t === "welcome" || m.t === "error");
+    ok(odd.welcome.notes === "lock", "notes: unknown mode falls back to lock");
   }
 
   console.log(failed ? `\n${failed} FAILED` : "\nall passed");

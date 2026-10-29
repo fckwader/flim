@@ -4,9 +4,10 @@
 import fl, flbuild, struct, sys, os, re
 
 def session_pids(log=os.path.join(os.environ['TEMP'], 'flim_engine.log')):
+    # the test FLs are named A (leader) and B (member) by restart_test.ps1 / restart_dev.ps1
     t = open(log, encoding='utf-8', errors='replace').read()
-    pid = lambda role: int(re.findall(r'\[(\d+)\] server: \{"t":"welcome".{0,40}"role":"%s"' % role, t)[-1])
-    return pid('leader'), pid('member')
+    pid = lambda name: int(re.findall(r'\[(\d+)\] I am %s \(fl-' % name, t)[-1])
+    return pid('A'), pid('B')
 
 try: A, B = session_pids()
 except (OSError, IndexError): A = B = None
