@@ -280,6 +280,7 @@ static void send_full_state(void);
 static void send_notes_full(void);
 static void notes_rebaseline(void);
 static void proj_begin(const char *why);
+static int fl_loading(void);
 static void clips_rebaseline(void);
 static int  unit_before_send(const char *key, int isPat, int idx, const unsigned char *d, unsigned n);
 static void unit_agreed(int isPat, int idx, const unsigned char *d, unsigned n);
@@ -1608,10 +1609,12 @@ static void scan_notes(DWORD now) {
             if (g_patSeen[p] != g_patHash[p] && (LONG)(now - g_patSuppress[p]) >= 0) pend[np++] = p;
         }
     }
-    if (np >= NOTES_BULK) {
-        // project load/new: never broadcast as edits (the param bulk guard syncs the whole project)
+    if (np >= NOTES_BULK && fl_loading()) {
+        // FL is inside an .flp load: never broadcast as edits (project sync sends the whole project).
+        // Other loads are caught by proj_begin before notes settle; a big edit (transpose across many
+        // patterns) must still go out. Fix found by cashflowbeatz (Rooms 0.2.24).
         for (i = 0; i < np; i++) g_patHash[pend[i]] = g_patSeen[pend[i]];
-        logmsg("NOTES bulk change in %d patterns: not sent", np);
+        logmsg("NOTES bulk change in %d patterns during a load: not sent", np);
         return;
     }
     for (i = 0; i < np; i++) enqueue_unit(T_NOTESNAP, 0, pend[i], 0, 0, NULL);
@@ -7209,7 +7212,11 @@ static void samples_resolve(const char *m) {
         wchar_t full[SAMPLE_PATH_MAX], found[SAMPLE_PATH_MAX];
         char hx[65];
         uint64_t sz;
-        if (!g_noLocal && expand_path(R[i].p, full, SAMPLE_PATH_MAX) && sample_hash(full, hx, &sz) && strcmp(hx, R[i].hex) == 0) {
+        // Never open a sender's network path (\\host\share\..., //host/...): that would make this PC
+        // connect to whatever host a peer names. Such samples come by content like any other.
+        // Fix found by cashflowbeatz (Rooms 0.2.24).
+        int remote = (R[i].p[0] == L'\\' || R[i].p[0] == L'/') && (R[i].p[1] == L'\\' || R[i].p[1] == L'/');
+        if (!g_noLocal && !remote && expand_path(R[i].p, full, SAMPLE_PATH_MAX) && sample_hash(full, hx, &sz) && strcmp(hx, R[i].hex) == 0) {
             map_set(R[i].p, NULL);                      // the same file is right where the peer has it
             continue;
         }

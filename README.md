@@ -202,6 +202,8 @@ both when the leader's project is sent and when someone loads a new sample durin
   e.g. *"Sending them uploads 60.6 MB (63,504,132 bytes). Send them now?"*. **No** leaves those samples
   out (they will be missing for the others) and flim won't ask about them again until FL restarts.
 - Samples in FL's factory content are never sent: every FL installation has them.
+- Samples on someone else's network share (`\\PC\share\...`) are always downloaded like the rest:
+  your flim never connects to a network location named by another person.
 - Samples inside plugin states are found too: in FPC (and other newer Image-Line plugins that store
   them the same way), and as plain file paths in any other plugin's state. For the latter, the
   receiving copy points at a link to the downloaded file under `Documents\flim\samples\`, named to
@@ -224,6 +226,13 @@ flimrooms is a separate Windows app: create or join a room with your name and an
 starts its own FL Studio with its own flim and connects through cashflowbeatz's relay (on Cloudflare),
 so the projects and samples of Rooms sessions go through his server, not `flim.fly.dev` or yours.
 Rooms sessions and Host / Connect sessions don't mix.
+
+Since flimrooms 0.2.25, samples can go **directly between the people in a room** (an encrypted
+peer-to-peer connection) instead of being downloaded from his server. Each new sample is still
+uploaded to his server once, as a backup for late joiners and networks where a direct connection
+fails. Everyone in the room needs 0.2.25 for this. Closing the flimrooms window keeps it running in
+the background while its FL Studio is open (so it can keep sending files); open it again to get the
+window back.
 
 - Download `flim-rooms-<version>-win64.exe` from the [latest release](../../releases/latest) (a
   separate download from `flim-client-win64.zip`). It's a portable app: no installer.
@@ -373,7 +382,10 @@ off and FL runs as usual: nothing breaks, it just doesn't sync. What you can do:
 - **[cashflowbeatz](https://github.com/cashflowbeatz)**: **Rooms** (the flimrooms app, its relay and
   its flim engine, all his) and the **note merging** behind the host's *Merge* option
   (`client/common/flim_notes_crdt.h`, used unchanged). Both come from his
-  [pull request #1](../../pull/1). Thank you!
+  [pull request #1](../../pull/1). His [pull request #2](../../pull/2) brought flimrooms 0.2.24 and
+  0.2.25 (direct sample transfers) and two fixes we applied to flim's own engine: edits that change
+  notes in 8 or more patterns at once are no longer dropped, and samples on another person's network
+  share are downloaded instead of opened. Thank you!
 
 ---
 
