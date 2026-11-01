@@ -159,7 +159,8 @@ def t_layout(a, b, v):
               ('PASS' if ok else 'FAIL', nm + ' layout offsets', hex(hwnd), cls.value, tpp, W_, H, L, T, vs), flush=True)
 
 
-FL_DIRS = {'25.2.3.5171': r'C:\Program Files (x86)\Image-Line\FL Studio 2025',
+FL_DIRS = {'25.2.5.5319': r'C:\Program Files (x86)\Image-Line\FL5319', # just gonna follow the 4997 directory's standard
+           '25.2.3.5171': r'C:\Program Files (x86)\Image-Line\FL Studio 2025',
            '25.1.6.4997': r'C:\Program Files (x86)\Image-Line\FL4997'}
 MASK_FX = 48
 
