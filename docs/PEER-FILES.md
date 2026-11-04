@@ -28,13 +28,17 @@ flowchart LR
 4. The native receiver checks the full byte count and SHA-256 before accepting the file.
    An unavailable, changed, corrupt or interrupted direct transfer falls back to R2. The
    waiting musical edit uses the existing retry and path-rewrite flow.
+5. Starting with 0.2.26, verified local and received copies also register for onward serving.
+   Another participant can try that recipient when the original file companion is unavailable.
+   Registration is reused for unchanged files and renewed after a native reconnect. This does
+   not change the room's lifetime: the host's native room departure still ends the room.
 
 Choose the destination in **Files > Save received files to > Choose folder** before opening
 FL for the room. Direct and R2 downloads use that same destination and cache.
 
 ## Requirements and limits
 
-- Both sides need the 0.2.25 app and its bundled engine for a direct transfer. Earlier clients
+- Both sides need the 0.2.25 or newer app and its bundled engine for a direct transfer. Earlier clients
   keep using R2 and can remain in the same room. No Node.js service, VPN, Syncthing or separate
   client installation is needed on a friend's computer.
 - Close the app's controls to hide them while a launched FL session is running. The background
@@ -73,11 +77,12 @@ revokes its companion; the host leaving still ends the room.
 
 `npm run test:peer` runs actual Electron WebRTC channels against a local Cloudflare emulator.
 It compares a 2,097,171-byte file, checks two simultaneous downloads, changed sources, lost peers,
-local authentication, stale generations and one deliberate R2 fallback. Three direct downloads
-cause no R2 reads; the deliberate fallback causes one. The test uses two isolated launch
+alternate-source recovery, onward serving, local authentication, stale generations and one
+deliberate R2 fallback. Five direct downloads cause no R2 reads; the deliberate fallback causes
+one. The test uses three isolated launch
 sessions in one test app, not two physical computers or a remote NAT test.
 
 Native WinHTTP loopbacks separately check registration, SHA-256 acceptance, corrupt/missing peer
 fallback, restored progress and direct access during an R2 retry pause. Broker tests cover
 concurrency, cleanup, session replacement and malformed input. See [testing](TESTING.md) and
-[0.2.25 QA](../client/desktop/QA-0.2.25.md) for results and remaining coverage.
+[0.2.27 QA](../client/desktop/QA-0.2.27.md) for results and remaining coverage.

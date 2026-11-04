@@ -14,6 +14,46 @@ const roomReply = { room: '12345678', password: PASSWORD, hostToken: TICKET, web
 const activeStatus = fl => ({room: roomReply.room, state: 'active', maxParticipants: 8, peers: [{id: 'host', name: 'Host', role: 'leader', fl}]});
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 
+test('confirmed FL launches stay confirmed when optional peer lifetime tracking throws', async t => {
+  const f = await fixture(t, {peerFiles: {prepare: async () => ({launched() {throw new Error('tracking');}})}});
+  await f.bridge.createRoom(f.input); await f.bridge.launchFL(); assert.equal(f.bridge.room.state, 'launched');
+});
+test('optional cancellation cannot mask a definite launch failure and attempted folders are released', async t => {
+  const f = await fixture(t, {peerFiles: {prepare: async () => ({cancel() {throw new Error('cancel');}})}, launch: async () => {throw new BridgeError('launcher refused', 'native_failed');}});
+  await f.bridge.createRoom(f.input); await assert.rejects(f.bridge.launchFL(), /launcher refused/);
+  assert.equal(f.bridge.room.state, 'ready'); assert.equal(f.bridge.room.sampleDirectory, undefined);
+});
+test('reservation expiry during direct-file preparation prevents launch and cancels preparation', async t => {
+  let canceled = 0; const f = await fixture(t);
+  f.bridge.peerFiles = {prepare: async () => {f.bridge.room.expiresAt = new Date(99_000).toISOString(); return {cancel() {canceled++;}};}};
+  await f.bridge.createRoom(f.input); await assert.rejects(f.bridge.launchFL(), /reservation expired/);
+  assert.equal(canceled, 1); assert.equal(f.calls.filter(call => call.args[0] === '--desktop').length, 0);
+});
+test('reinitialization detects removed native files instead of retaining an earlier ready flag', async t => {
+  const f = await fixture(t); assert.equal(f.bridge.nativeReady, true);
+  await fs.unlink(path.join(f.nativeDir, 'flim_engine.dll')); await f.bridge.initialize(); assert.equal(f.bridge.nativeReady, false);
+});
+test('failed diagnostics availability cannot stop state, room setup or recovery', async t => {
+  const f = await fixture(t); f.bridge.diagnosticsStatus = () => {throw new Error('disk');};
+  assert.equal(f.bridge.state().diagnosticsAvailable, false); await f.bridge.createRoom(f.input);
+});
+test('installation chooser absence gives an actionable error and releases busy state', async t => {
+  const f = await fixture(t); f.bridge.chooseDirectory = undefined;
+  await assert.rejects(f.bridge.chooseInstall(), /complete flim app/); assert.equal(f.bridge.busy, false);
+});
+test('a slower installation scan cannot overwrite the latest completed scan', async t => {
+  const f = await fixture(t); let release, first = true;
+  const inspect = f.bridge.inspect.bind(f.bridge);
+  f.bridge.inspect = async dir => {if (first) {first = false; await new Promise(resolve => {release = resolve;});} return inspect(dir);};
+  const earlier = f.bridge.scanInstalls(); while (!release) await new Promise(resolve => setImmediate(resolve));
+  await f.bridge.scanInstalls(); const latest = f.bridge.installs; release(); await earlier;
+  assert.equal(f.bridge.installs, latest);
+});
+test('participant names remove invisible formatting and repair malformed Unicode', async t => {
+  const f = await fixture(t, {fetch: async url => response(url.endsWith('/status') ? {...activeStatus('26.1.7.5654'), peers: [{id: 'host', role: 'leader', fl: '26.1.7.5654', name: '\u200b\ufeff\u2060'}]} : roomReply)});
+  await f.bridge.createRoom(f.input); await f.bridge.refreshRoom(); assert.equal(f.bridge.room.peers[0].name, 'Participant');
+});
+
 test('canonically equivalent accented names retain their accent in preferences and the FL environment', async t => {
   const f = await fixture(t); const name = 'Jose\u0301';
   assert.equal(displayName(name), 'José');

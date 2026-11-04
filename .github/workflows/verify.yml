@@ -1,7 +1,7 @@
 name: Verify source
 on:
   push:
-    branches: [main, fl26-compatibility-audit, cloudflare-peer-files]
+    branches: [main, fl26-compatibility-audit, cloudflare-peer-files, 'rooms-*']
   pull_request:
 permissions:
   contents: read
@@ -58,7 +58,7 @@ jobs:
         shell: pwsh
         working-directory: client/dev/harness
         run: |
-          $names = 'samples','file_status','files','ws_buffer','launcher','injection','injection_experimental','build_gate','build_gate_experimental','patops','compat','clip','clip_native','cloud','profiles','profile_loader','flp','plugin_apply','plugins','portable','metadata','notes','notes_crdt','rooms','startup','toolbar','project_load','queues','inbound','logging','edit_compat','sweep24'
+          $names = 'samples','file_status','files','ws_buffer','launcher','injection','injection_experimental','build_gate','build_gate_experimental','patops','compat','clip','clip_native','cloud','profiles','profile_loader','flp','plugin_apply','plugins','portable','metadata','notes','notes_crdt','rooms','startup','toolbar','project_load','queues','inbound','logging','edit_compat','sweep24','workflow27'
           foreach ($name in $names) {
             & ".\t_$name.exe"
             if ($LASTEXITCODE) { throw "Native harness failed: $name" }

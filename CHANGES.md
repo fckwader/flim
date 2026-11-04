@@ -4,6 +4,26 @@ These changes support reviewed FL Studio 24/25/26 builds and improve shared proj
 
 In this document, **client** means the flim program running with your FL Studio. **Server** means the program that passes edits and sample files between you and your friends. An **edit lock** is a temporary reservation that stops two people from changing the same control at the same time. A **cache** is temporary file storage that can be cleared to make room.
 
+## Version 0.2.27: safer channels and browser-sample sharing (2026-11-03)
+
+57 additional fixes and safeguards confirm FL's channel adds/deletes before changing shared
+indices, preserve selection after interrupted moves, validate preset sample metadata and keep
+upload sources stable. Direct files get better source timing and recovery; optional file-service
+errors cannot overturn a confirmed FL launch. Installation scans, cancellation, Files status and
+error reporting receive further checks. Includes the earlier local 0.2.26 work.
+[All 57 changes explained](docs/releases/0.2.27.md) · [QA](client/desktop/QA-0.2.27.md).
+Reviewed builds remain 24.2.2.4597, 25.2.5.5319 and 26.1.7.5654. Validation ran locally before
+GitHub review. No Cloudflare deployment is included in this contribution.
+
+## Version 0.2.26: recover direct files and reuse verified samples (local, 2026-11-01)
+
+35 additional improvements fix next-source retry cancellation, abandoned serving slots, stale
+worker commands, connection setup ordering, blocked send buffers, incomplete content and timer
+cleanup. Verified recipients can serve samples onward, unchanged files avoid repeated registration,
+and a busy local peer cannot trigger a cloud quota pause. Exact FL24/25/26 checks and the compact
+UI remain in place. [All 35 improvements](docs/releases/0.2.26.md) · [QA](client/desktop/QA-0.2.26.md).
+This build stays local; no GitHub publication or Cloudflare deployment.
+
 ## Version 0.2.25: direct samples with Cloudflare coordination (2026-10-28)
 
 WebRTC transfers referenced samples directly when connected peers are available. Cloudflare

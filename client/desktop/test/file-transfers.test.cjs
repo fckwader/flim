@@ -10,6 +10,22 @@ const hash = 'a'.repeat(64);
 const item = {id: 'download:' + hash, name: 'kick.wav', direction: 'download', state: 'downloading', reason: '', bytes: 100, done: 50, updatedAt: 1000};
 const snapshot = items => JSON.stringify({version: 1, pid: 42, updatedAt: 1000, items});
 
+test('malformed Unicode file names cannot corrupt the status renderer', () => {
+  assert.throws(() => parseSnapshot(snapshot([{...item, name: 'bad\ud800.wav'}]), 42), /Invalid file status/);
+});
+test('oversized status directories retain confirmed activity and stop file reads', async t => {
+  const {store} = await fixture(t), room = {}, directory = await store.start(room);
+  await fs.writeFile(path.join(directory, 'files-42.json'), snapshot([item])); await store.snapshot(room);
+  let stats = 0; store.io = {...fs, readdir: async () => Array.from({length: 4097}, (_, i) => `files-${i + 1}.json`), open: async () => {stats++; throw new Error('must not read');}};
+  const result = await store.snapshot(room); assert.equal(result.stale, true); assert.equal(result.items.length, 1); assert.equal(stats, 0);
+});
+test('a close failure cannot hide the original local file read error', async () => {
+  const {readStableFile} = require('../electron/local-file.cjs');
+  const metadata = {isFile: () => true, isSymbolicLink: () => false, size: 5, dev: 1, ino: 1, mtimeMs: 1, ctimeMs: 1};
+  const io = {open: async () => ({stat: async () => metadata, read: async () => {throw Object.assign(new Error('read'), {code: 'EIO'});}, close: async () => {throw new Error('close');}})};
+  await assert.rejects(readStableFile(io, 'fixture', 100, metadata), {code: 'EIO'});
+});
+
 test('file activity rejects reversed transfer states and gives invisible-only names a usable label', () => {
   assert.throws(() => parseSnapshot(snapshot([{...item, state: 'uploading'}]), 42));
   assert.throws(() => parseSnapshot(snapshot([{...item, direction: 'upload', id: 'upload:' + hash}]), 42));

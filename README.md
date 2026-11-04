@@ -67,6 +67,24 @@ Open **Files →** whenever you need it, then hide it to return to the compact r
 files are reused by content hash. Hidden status panels stop polling; native transfers continue
 while FL stays open. No Syncthing process or whole sample-pack mirroring is required.
 
+## Changes submitted for review: 0.2.26 and 0.2.27
+
+**0.2.27 adds 57 fixes and safeguards** for shared channel adds/deletes, channel order,
+browser-sample attachments, stable uploads, direct-file recovery and room launch. Each change
+is explained in [the numbered release notes](docs/releases/0.2.27.md), with checks and remaining
+limits in [the QA record](client/desktop/QA-0.2.27.md).
+
+It includes [0.2.26's 35 transfer-recovery improvements](docs/releases/0.2.26.md), including
+trying another source, canceled-upload cleanup and onward serving of verified received samples.
+Reviewed FL builds remain 24.2.2.4597, 25.2.5.5319 and 26.1.7.5654; no new build profiles were added.
+
+Local checks passed: **246 desktop tests, 33 native harnesses, 195 UI checks, 76 Worker tests**,
+native HTTP/file-sync loopbacks, actual Electron WebRTC, and package/portable startup. The native
+fixtures include nine host/member combinations. These checks do not establish physical MIDI,
+two-computer internet behavior or every FL patch. The earlier intermittent FL24 recovery-save
+stall remains unresolved. The download link above still points to the published 0.2.25 executable.
+This contribution does not deploy Cloudflare or change live rooms.
+
 ## What's new in 0.2.24 and 0.2.25
 
 **0.2.25 adds direct sample downloads between participants.** Cloudflare keeps room permissions,

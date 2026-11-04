@@ -1,0 +1,95 @@
+{
+  "version": "0.2.26",
+  "date": "2026-11-02T04:35:10.235Z",
+  "sourceBaseline": "2555c89",
+  "uncommittedChanges": true,
+  "localOnly": true,
+  "reviewedBuilds": [
+    "24.2.2.4597",
+    "25.2.5.5319",
+    "26.1.7.5654"
+  ],
+  "profilesChanged": false,
+  "artifact": {
+    "file": "client/desktop/release/flim-rooms-0.2.26-win64.exe",
+    "bytes": 103587012,
+    "sha256": "5f9f6d2a732e4b6c3f570e2f6b850bdab7dfb5cc401df05e723613c1609c7d13"
+  },
+  "native": {
+    "launcher": "a564e237819902d70a40086a49a5bd107fc3bba5b9814e28ceb6e4d2d22c92af",
+    "engine": "f47804f9c59f8e1d66c50c547929f114147bbd42fde006fe310c4905961d6ce7"
+  },
+  "desktopTests": 224,
+  "nativeHarnessExecutables": 32,
+  "syntheticNativeHostMemberCombinations": 9,
+  "nativeHttpChecks": 13,
+  "nativeFileSyncAndStatusChecks": 18,
+  "roomUiChecks": 127,
+  "filesUiChecks": 68,
+  "localCloudflareTests": 76,
+  "nativeHttpLoopback": true,
+  "nativeFileSyncLoopback": true,
+  "packagedStartup": true,
+  "portableStartup": true,
+  "realElectron": [
+    "folder dialog and persistence",
+    "window/mode/zoom",
+    "sidebar geometry and focus",
+    "bounded controls recovery"
+  ],
+  "peerFiles": {
+    "local": {
+      "passed": true,
+      "bytes": 2097171,
+      "participants": 3,
+      "directDownloads": 5,
+      "checks": [
+        "Actual encrypted WebRTC file bytes through Cloudflare emulator signaling",
+        "Two simultaneous direct downloads with bounded chunk flow",
+        "Loopback authentication and browser-origin rejection",
+        "Stale generation rejection",
+        "Transport renderer crash reconnects and restores readiness",
+        "Changed first source retries the next available source",
+        "Verified receiver serves onward after the original file companion stops",
+        "Lost direct peers leave verified R2 copy usable"
+      ],
+      "diagnostics": [
+        {
+          "event": "peer_download",
+          "bytes": 2097171
+        },
+        {
+          "event": "peer_download",
+          "bytes": 2097171
+        },
+        {
+          "event": "peer_download",
+          "bytes": 2097171
+        },
+        {
+          "event": "peer_download",
+          "bytes": 2097171
+        },
+        {
+          "event": "peer_download",
+          "bytes": 2097171
+        }
+      ],
+      "r2Downloads": 1,
+      "signaling": "Local Cloudflare emulator"
+    },
+    "scope": "Three isolated launch sessions on one computer, local Cloudflare emulator; no physical FL or remote NAT claim"
+  },
+  "cloudflare": {
+    "sourceChanged": false,
+    "deployedThisPass": false,
+    "turnSubscriptionAdded": false,
+    "initialR2UploadsRetained": true
+  },
+  "githubWrites": false,
+  "noFreshTwoComputerOrMidiTest": true,
+  "userFLProcessesOperated": false,
+  "knownUnresolved": [
+    "Earlier intermittent FL24 recovery-save stall; no fresh live retest"
+  ]
+}

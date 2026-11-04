@@ -33,12 +33,13 @@ async function native(url, hello) {
     const wsRelay = relay.replace(/^http/, 'ws');
     const host = await native(wsRelay + `room/${room.room}`, {...hello, t: 'host', owner: room.hostToken, user: {id: 'peer-a', name: 'Fixture A'}, compat: {protocol: 1, wire: 'flim-25-26-v1', fl: '24.2.2.4597'}}); sockets.push(host.ws);
     const member = await native(wsRelay + `room/${room.room}`, {...hello, t: 'join', user: {id: 'peer-b', name: 'Fixture B'}, compat: {protocol: 1, wire: 'flim-25-26-v1', fl: '26.1.7.5654'}}); sockets.push(member.ws);
+    const third = await native(wsRelay + `room/${room.room}`, {...hello, t: 'join', user: {id: 'peer-c', name: 'Fixture C'}, compat: {protocol: 1, wire: 'flim-25-26-v1', fl: '25.2.5.5319'}}); sockets.push(third.ws);
     const bytes = Buffer.alloc(2 * 1024 * 1024 + 19); for (let i = 0; i < bytes.length; i++) bytes[i] = i % 251;
     const hash = createHash('sha256').update(bytes).digest('hex'), source = path.join(tmp, 'kick.wav'); await fs.writeFile(source, bytes);
     const uploaded = await (mf ? mf.dispatchFetch.bind(mf) : fetch)(relay + 'blob/' + hash, {method: 'PUT', headers: {'x-flim-key': host.welcome.blob, 'content-length': String(bytes.length)}, body: bytes}); assert.equal(uploaded.status, 201);
     const result = path.join(__dirname, 'evidence', require('../package.json').version, live ? 'peer-live.json' : 'peer-electron.json'); await fs.mkdir(path.dirname(result), {recursive: true});
     await fs.rm(result, {force: true});
-    const config = path.join(tmp, 'config.json'); await fs.writeFile(config, JSON.stringify({relay, live: !!live, room: room.room, tokens: [host.welcome.file_peer, member.welcome.file_peer], blob: host.welcome.blob, source, result}));
+    const config = path.join(tmp, 'config.json'); await fs.writeFile(config, JSON.stringify({relay, live: !!live, room: room.room, tokens: [host.welcome.file_peer, member.welcome.file_peer, third.welcome.file_peer], blob: host.welcome.blob, source, result}));
     const child = spawn(path.join(root, 'node_modules/electron/dist/electron.exe'), [path.join(__dirname, 'peer-electron-fixture.cjs'), '--user-data-dir=' + path.join(tmp, 'profile')], {cwd: root, env: {...process.env, FLIM_PEER_TEST_CONFIG: config}, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe']});
     child.stdout.on('data', data => process.stdout.write(data)); child.stderr.on('data', data => process.stderr.write(data));
     const timer = setTimeout(() => child.kill(), 60000);

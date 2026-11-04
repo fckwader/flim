@@ -1,5 +1,31 @@
 # Testing and verification
 
+## Recorded 0.2.27 local results
+
+246 desktop tests, 33 native harnesses, 19 native HTTP checks, 18 file-sync/status checks,
+195 UI checks and 76 Worker tests pass. The native workflow harness exercises confirmed channel
+adds/deletes, stale targets, reorder bounds, no-op orders, selection recovery and stale hashes.
+The HTTP fixture verifies upload write exclusion, source length, conflict retry and per-file
+retry progress. Actual Electron WebRTC passes with five direct downloads across three isolated
+sessions against the local Cloudflare emulator. Folder/window/sidebar/zoom/recovery checks pass.
+
+[All 57 changes](releases/0.2.27.md) and [0.2.27 QA](../client/desktop/QA-0.2.27.md) separate
+synthetic fixtures from physical FL/MIDI coverage. No new FL profile or deployed-relay check.
+The earlier intermittent FL24 recovery-save stall remains unresolved.
+
+## Recorded 0.2.26 local results
+
+224 desktop tests, 32 native harnesses (including nine synthetic host/member combinations),
+13 native HTTP checks, 18 file-sync/status checks, 195 UI checks and 76 local Worker tests pass.
+The three-session Electron WebRTC fixture transfers a 2,097,171-byte file five times directly
+with two concurrent requests, recovers its hidden worker, tries an alternate source and serves
+a verified received copy after the original file companion stops. Its one forced R2 fallback
+causes exactly one R2 read. Folder/window/sidebar/zoom/recovery checks also pass.
+
+[0.2.26 QA](../client/desktop/QA-0.2.26.md) records final artifact checks and limits. This pass
+is local only; it does not run a new deployed-relay or physical FL/MIDI test. The historical
+results below retain the scope of their own release.
+
 ## Recorded 0.2.25 results
 
 | Check | Recorded result | What it establishes |
@@ -49,7 +75,7 @@ app. They inspect/discover installations but do not allocate a room or start FL.
 suitable for a generic CI runner with no FL installations.
 
 Build native harnesses with `cmd /c client\dev\harness\build.bat` from the root. Execute the
-32 deterministic harnesses listed in the CI workflow. Transfer harnesses require their loopback
+33 deterministic harnesses listed in the CI workflow. Transfer harnesses require their loopback
 orchestrators rather than being run directly:
 
 ```powershell

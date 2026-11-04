@@ -24,12 +24,21 @@ function createPeerFiles({BrowserWindow, ipcMain, session, relay, record, idle})
       for (const s of core.sessions.values()) {s.ready.clear(); s.ws?.close();}
       for (const reply of replies.values()) reply(false); replies.clear();
     });
-    ready = window.loadURL(url); return ready;
+    ready = window.loadURL(url).catch(error => {
+      if (window === current) {window = null; if (!current.isDestroyed()) current.destroy();}
+      throw error;
+    }); return ready;
   }
-  const send = async m => {await ensure(); window.webContents.send('flim:peer-command', m);};
-  const transport = {send: m => {void send(m).catch(() => {});}, chunk: m => new Promise((resolve, reject) => {
-    const reply = randomUUID(); const timer = setTimeout(() => {replies.delete(reply); reject(new Error('worker_timeout'));}, 10000);
-    replies.set(reply, ok => {clearTimeout(timer); if (ok) resolve(); else reject(new Error('worker_closed'));});
+  const send = async m => {const loading = ensure(), target = window; await loading;
+    if (closing || !target || target.isDestroyed() || window !== target) throw new Error('worker_closed');
+    target.webContents.send('flim:peer-command', m);
+  };
+  const transport = {send: m => {void send(m).catch(() => {});}, chunk: (m, signal) => new Promise((resolve, reject) => {
+    const reply = randomUUID(); const timer = setTimeout(() => {const done = replies.get(reply); replies.delete(reply); done?.(false);}, 10000);
+    const abort = () => {const done = replies.get(reply); replies.delete(reply); done?.(false);};
+    replies.set(reply, ok => {clearTimeout(timer); signal?.removeEventListener('abort', abort); if (ok) resolve(); else reject(new Error('worker_closed'));});
+    signal?.addEventListener('abort', abort, {once: true});
+    if (signal?.aborted) {abort(); return;}
     const data = m.data.buffer.slice(m.data.byteOffset, m.data.byteOffset + m.data.byteLength);
     void send({...m, data, reply}).catch(() => {const done = replies.get(reply); replies.delete(reply); done?.(false);});
   })};

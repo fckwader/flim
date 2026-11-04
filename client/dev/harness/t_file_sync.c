@@ -28,12 +28,15 @@ static void mode(const char *value) {
 int main(int argc, char **argv) {
     unsigned char image[8192] = {0};
     wchar_t source[MAX_PATH], second[MAX_PATH], peer[MAX_PATH], cache[MAX_PATH * 2];
-    char *message, hash[65], actual[65], *copy, *outgoing;
+    char *message, hash[65], actual[65], count[16], *copy, *outgoing;
     uint64_t bytes; size_t n = 22; FILE *file;
     assert(argc == 2);
     InitializeCriticalSection(&g_sampleLock); InitializeCriticalSection(&g_netTextLock); InitializeCriticalSection(&g_sendLock);
     assert(parse_host(argv[1], &g_blobUrl)); strcpy_s(g_blobKey, sizeof(g_blobKey), "file-sync-fixture");
-    g_blobOn = 1; g_cloudTransport = 1;
+    g_blobOn = 1; g_cloudTransport = 1; g_netGen = 1;
+    assert(SetEnvironmentVariableA("FLIM_PEER_URL", argv[1]));
+    assert(SetEnvironmentVariableA("FLIM_PEER_TOKEN", "1111111111111111111111111111111111111111111111111111111111111111"));
+    peer_welcome("{\"file_peer\":\"2222222222222222222222222222222222222222222222222222222222222222\"}"); assert(g_peerReady);
     assert(GetFullPathNameW(L"kick.wav", MAX_PATH, source, NULL));
     assert(GetFullPathNameW(L"same-kick.wav", MAX_PATH, second, NULL));
     assert(GetFullPathNameW(L"peer", MAX_PATH, peer, NULL));
@@ -62,9 +65,12 @@ int main(int argc, char **argv) {
     assert(!g_compatFault && cache_path(hash, source, cache, MAX_PATH * 2));
     assert(hash_file(cache, actual) && !strcmp(actual, hash));
     assert(g_npmap == 2 && !wcscmp(g_pmap[0].to, g_pmap[1].to));
+    assert(blob_http(L"GET", "/offer-count", NULL, 0, NULL, 0, NULL, NULL, count, sizeof(count), 0) == 200 && !strcmp(count, "3"));
     puts("PASS background download retries, verifies audio, and maps two paths to one local cached file");
     samples_resolve(message);
+    assert(blob_http(L"GET", "/offer-count", NULL, 0, NULL, 0, NULL, NULL, count, sizeof(count), 0) == 200 && !strcmp(count, "3"));
     puts("PASS a repeated shared edit reuses the verified local cache");
+    puts("PASS verified received samples are offered to other peers once per unchanged file");
     assert(DeleteFileW(cache));
     {
         int fault;

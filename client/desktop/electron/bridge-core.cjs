@@ -79,7 +79,8 @@ async function jsonResponse(response) {
       return data;
     }
     catch { throw new BridgeError('The relay returned an invalid response.'); }
-  } finally { try { reader.releaseLock(); } catch {} }
+  } catch (error) {try {await reader.cancel();} catch {} throw error;}
+  finally { try { reader.releaseLock(); } catch {} }
 }
 
 const SERVER_ERRORS = {
@@ -122,7 +123,7 @@ function parseRoom(data, role, expectedCode) {
 function samePath(a, b) { return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase(); }
 function validInstallPath(value) { return typeof value === 'string' && value.length > 0 && value.length <= 500 && path.isAbsolute(value) && !/[\x00-\x1f\x7f]/.test(value); }
 function peerName(value) {
-  return value.normalize('NFC').replace(/[\x00-\x1f\x7f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '').trim().slice(0, 24).replace(/[\uD800-\uDBFF]$/, '') || 'Participant';
+  return value.toWellFormed().normalize('NFC').replace(/[\x00-\x1f\x7f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '').trim().slice(0, 24).replace(/[\uD800-\uDBFF]$/, '') || 'Participant';
 }
 
 function versionParts(value) {
@@ -167,10 +168,12 @@ class DesktopBridge {
     this.statusFailures = 0; this.statusRetryAt = 0; this.serverRetryAt = 0;
     this.notice = '';
     this.preferencesNotice = '';
+    this.scanGeneration = 0;
   }
 
   async initialize() {
     let saved = {};
+    this.nativeReady = false;
     this.sampleDirectory = ''; this.sampleLocationError = '';
     try {
       saved = JSON.parse(await readStableFile(this.io, this.preferencesFile, 16_384));
@@ -210,6 +213,7 @@ class DesktopBridge {
   }
 
   async scanInstalls(preferredPath = '', additionalPaths = []) {
+    const generation = ++this.scanGeneration;
     preferredPath ||= this.installs.get(this.selectedInstallId)?.path || '';
     const directories = new Set([...this.extraPaths, ...additionalPaths]);
     if (preferredPath) directories.add(preferredPath);
@@ -241,6 +245,7 @@ class DesktopBridge {
         if (preferredPath && samePath(install.path, preferredPath)) selectedId = install.id;
       }
     }
+    if (generation !== this.scanGeneration) return this.state();
     this.installs = next;
     this.selectedInstallId = selectedId || [...next.values()].find(install => install.supported && !install.experimental)?.id || [...next.values()].find(install => install.supported)?.id || [...next.keys()][0] || '';
     return this.state();
@@ -248,8 +253,10 @@ class DesktopBridge {
 
   state() {
     const { password, hostToken, sampleDirectory, ...room } = this.room ?? {};
+    let diagnosticsAvailable = false;
+    try {diagnosticsAvailable = this.diagnosticsStatus() === true;} catch {}
     return { platform: this.platform, name: this.name, installs: [...this.installs.values()], selectedInstallId: this.selectedInstallId,
-      room: this.room ? room : null, busy: this.busy, nativeReady: this.nativeReady, diagnosticsAvailable: this.diagnosticsStatus(), notice: [this.notice, this.preferencesNotice].filter(Boolean).join(' ') };
+      room: this.room ? room : null, busy: this.busy, nativeReady: this.nativeReady, diagnosticsAvailable, notice: [this.notice, this.preferencesNotice].filter(Boolean).join(' ') };
   }
 
   log(event, fields) {
@@ -366,6 +373,7 @@ class DesktopBridge {
   async chooseInstall(currentInstallId) {
     return this.exclusive(async () => {
       if (this.room) throw new BridgeError('Leave this room before choosing another installation.');
+      if (!this.chooseDirectory) throw new BridgeError('Reopen the complete flim app to choose an FL Studio folder.');
       if (typeof currentInstallId === 'string' && this.installs.has(currentInstallId)) this.selectedInstallId = currentInstallId;
       const directory = await this.chooseDirectory(this.installs.get(this.selectedInstallId)?.path); if (!directory) return;
       const install = await this.inspect(directory); this.installs.set(install.id, install); this.selectedInstallId = install.id;
@@ -499,6 +507,8 @@ class DesktopBridge {
       let peerSession;
       try {peerSession = await this.peerFiles?.prepare(room.code); if (peerSession) Object.assign(env, peerSession.env);}
       catch {this.log('peer_unavailable', {message: 'Direct file setup unavailable; relay transfers remain enabled.'});}
+      try {this.checkReservation(room);}
+      catch (error) {try {peerSession?.cancel();} catch {} throw error;}
       try {
         // The native launcher owns its injection timeout and cleans up suspended FL on failure.
         const output = await this.run(path.join(this.nativeDir, 'flim.exe'), args,
@@ -506,10 +516,14 @@ class DesktopBridge {
         let result; try { result = JSON.parse(output); } catch { throw new BridgeError('The launcher did not confirm that FL Studio opened. Check FL Studio before trying again.', 'native_uncertain'); }
         if (!result || Array.isArray(result) || result.launched !== true || !Number.isSafeInteger(result.pid) || result.pid < 1 || result.pid > 0xffffffff) throw new BridgeError('The launcher did not confirm that FL Studio opened. Check FL Studio before trying again.', 'native_uncertain');
         room.state = 'launched';
-        peerSession?.launched(result.pid);
+        try {peerSession?.launched(result.pid);}
+        catch {this.log('peer_unavailable', {message: 'FL opened, but direct file lifetime tracking failed. Relay transfers remain enabled.'});}
         this.log('launch_confirmed', {...details, pid: result.pid, durationMs: Math.max(0, this.now() - started)}); this.logStatus();
       } catch (error) {
-        if (error instanceof BridgeError && error.code === 'native_failed') peerSession?.cancel();
+        if (error instanceof BridgeError && error.code === 'native_failed') {
+          try {peerSession?.cancel();} catch {}
+          delete room.sampleDirectory;
+        }
         this.log('launch_failed', {...details, code: error?.code, message: error?.message, durationMs: Math.max(0, this.now() - started)});
         if (!(error instanceof BridgeError) || error.code !== 'native_failed') room.state = 'uncertain';
         throw error;

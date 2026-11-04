@@ -1,6 +1,6 @@
 {
   "name": "flim-desktop",
-  "version": "0.2.25",
+  "version": "0.2.27",
   "private": true,
   "type": "module",
   "description": "Create a room, invite a friend, and open FL Studio together.",
@@ -12,7 +12,7 @@
     "start": "electron .",
     "icons": "electron scripts/build-icons.cjs",
     "build": "tsc --noEmit && vite build",
-    "test": "node --test test/bridge.test.cjs test/sample-location.test.cjs test/diagnostics.test.cjs test/install-options.test.mjs test/window-fit.test.cjs test/renderer-recovery.test.cjs test/file-transfers.test.cjs test/reliability-0222.test.cjs test/peer-core.test.cjs",
+    "test": "node --test test/bridge.test.cjs test/sample-location.test.cjs test/diagnostics.test.cjs test/install-options.test.mjs test/window-fit.test.cjs test/renderer-recovery.test.cjs test/file-transfers.test.cjs test/reliability-0222.test.cjs test/peer-core.test.cjs test/peer-worker.test.cjs test/peer-electron-adapter.test.cjs",
     "test:peer": "node test/peer-electron.cjs",
     "test:files:ui": "npm run build -- --outDir dist-files && node test/file-sidebar-ui.cjs",
     "test:files:package": "node test/file-sidebar-package.cjs",

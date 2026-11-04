@@ -13,7 +13,7 @@ function parseSnapshot(source, pid) {
   if (!value || value.version !== 1 || value.pid !== pid || !Number.isInteger(pid) || pid < 1 || pid > 0xffffffff || !Array.isArray(value.items) || value.items.length > 96 || !Number.isSafeInteger(value.updatedAt) || value.updatedAt < 0 || new Set(value.items.map(item => item?.id)).size !== value.items.length) throw new Error('Invalid file status.');
   return value.items.map(item => {
     if (!item || typeof item.id !== 'string' || !/^(?:upload|download):(?:[a-f0-9]{64}|path-[a-f0-9]{16})$/.test(item.id) ||
-        typeof item.name !== 'string' || !item.name || item.name.length > 768 || /[\\/\x00-\x1f\x7f]/.test(item.name) ||
+        typeof item.name !== 'string' || !item.name || item.name.length > 768 || !item.name.isWellFormed() || /[\\/\x00-\x1f\x7f]/.test(item.name) ||
         !['upload', 'download'].includes(item.direction) || !item.id.startsWith(item.direction + ':') || !STATES.has(item.state) || !REASONS.has(item.reason) ||
         (item.state === 'uploading' && item.direction !== 'upload') || (item.state === 'downloading' && item.direction !== 'download') ||
         !Number.isSafeInteger(item.bytes) || item.bytes < 0 || !Number.isSafeInteger(item.done) || item.done < 0 || item.done > item.bytes ||
@@ -51,7 +51,9 @@ class FileTransfers {
       try {
         const stat = await this.io.lstat(directory);
         if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Invalid status directory.');
-        const candidates = (await this.io.readdir(directory)).filter(name => /^files-[1-9]\d{0,9}\.json$/.test(name));
+        const names = await this.io.readdir(directory);
+        if (names.length > 4096) throw new Error('Status directory exceeds its file limit.');
+        const candidates = names.filter(name => /^files-[1-9]\d{0,9}\.json$/.test(name));
         const valid = candidates.filter(name => Number(name.slice(6, -5)) <= 0xffffffff).sort((a, b) => Number(a.slice(6, -5)) - Number(b.slice(6, -5)));
         const files = valid.slice(0, 16);
         const results = await Promise.allSettled(files.map(async name => {

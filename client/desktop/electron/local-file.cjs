@@ -9,6 +9,7 @@ async function readStableFile(io, file, limit, metadata) {
   metadata ??= await io.lstat(file);
   if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > limit || metadata.size < 0) throw new Error('Invalid local file.');
   const handle = await io.open(file, 'r');
+  let failure;
   try {
     if (!sameMetadata(metadata, await handle.stat())) throw changed('Local file changed before reading.');
     const bytes = Buffer.alloc(metadata.size + 1);
@@ -22,7 +23,8 @@ async function readStableFile(io, file, limit, metadata) {
     const current = await io.lstat(file);
     if (total !== metadata.size || current.isSymbolicLink() || !sameMetadata(metadata, await handle.stat()) || !sameMetadata(metadata, current)) throw changed('Local file changed while reading.');
     return new TextDecoder('utf-8', {fatal: true}).decode(bytes.subarray(0, total));
-  } finally { await handle.close(); }
+  } catch (error) {failure = error; throw error;}
+  finally {try {await handle.close();} catch (error) {if (!failure) throw error;}}
 }
 
 module.exports = {sameMetadata, readStableFile};

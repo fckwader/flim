@@ -70,3 +70,5 @@ if errorlevel 1 exit /b 1
 
 cl /nologo /W3 t_sweep24.c /Fe:t_sweep24.exe winhttp.lib shell32.lib user32.lib gdi32.lib bcrypt.lib advapi32.lib
 if errorlevel 1 exit /b 1
+cl /nologo /W3 t_workflow27.c /Fe:t_workflow27.exe winhttp.lib shell32.lib user32.lib gdi32.lib bcrypt.lib advapi32.lib
+if errorlevel 1 exit /b 1

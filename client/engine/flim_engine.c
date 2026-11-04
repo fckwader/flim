@@ -1808,17 +1808,21 @@ static void known_from_list(void) {
 }
 
 static void do_addch(const QItem *it) {
-    void **items; int n = chan_list(&items);
-    if (n != it->a || n >= MAX_CH) {
+    void **items, *before[MAX_CH]; int i, n = chan_list(&items), fault = 0;
+    if (it->unit != U_CH || it->a < 0 || n != it->a || n >= MAX_CH || (n && !items)) {
         logmsg("chan.add: expected index %d but have %d channels", it->a, n);
         sharing_fail("Shared channel: session stopped", "The channel lists no longer match. Reconnect and resync before continuing to share.");
         return;
     }
+    for (i = 0; i < n; i++) before[i] = items[i];
     void *obj = NULL;
-    __try { obj = g_addChannel(-1, 0, 1); } __except (EXCEPTION_EXECUTE_HANDLER) { obj = NULL; }
-    if (!obj) {
+    __try { obj = g_addChannel(-1, 0, 1); } __except (EXCEPTION_EXECUTE_HANDLER) { fault = 1; }
+    if (fault || !obj || chan_list(&items) != n + 1 || !items || items[n] != obj) {
         sharing_fail("Shared channel: session stopped", "FL Studio could not add the shared channel. Reconnect and resync before continuing to share.");
         return;
+    }
+    for (i = 0; i < n; i++) if (items[i] != before[i]) {
+        sharing_fail("Shared channel: session stopped", "FL Studio changed another channel while adding this channel. Reconnect and resync before continuing to share."); return;
     }
     known_from_list();
     memset(&g_chU[it->a], 0, sizeof(Unit));
@@ -1829,9 +1833,18 @@ static void do_addch(const QItem *it) {
 }
 
 static void do_delch(const QItem *it) {
-    void **items; int n = chan_list(&items);
-    if (it->a < 0 || it->a >= n) { logmsg("chan.del: index %d out of range (%d)", it->a, n); return; }
-    __try { g_delChannel((unsigned)it->a, 0, DELCHAN_FLAGS); } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("chan.del faulted"); }
+    void **items, *before[MAX_CH]; int i, n = chan_list(&items), fault = 0;
+    if (it->a < 0 || it->a >= n || !items) {
+        sharing_fail("Shared channel: session stopped", "The channel selected for deletion no longer exists. Reconnect and resync before continuing to share."); return;
+    }
+    for (i = 0; i < n; i++) before[i] = items[i];
+    __try { g_delChannel((unsigned)it->a, 0, DELCHAN_FLAGS); } __except (EXCEPTION_EXECUTE_HANDLER) { fault = 1; }
+    if (fault || chan_list(&items) != n - 1 || (n > 1 && !items)) {
+        sharing_fail("Shared channel: session stopped", "FL Studio did not confirm the channel deletion. Channel bookkeeping was kept."); return;
+    }
+    for (i = 0; i < n - 1; i++) if (items[i] != before[i < it->a ? i : i + 1]) {
+        sharing_fail("Shared channel: session stopped", "FL Studio changed another channel during deletion. Reconnect and resync before continuing to share."); return;
+    }
     units_shift_after_delete(it->a, n);
     known_from_list();
     notes_rebaseline(1);
@@ -1921,7 +1934,10 @@ static int index_of(void **list, int n, void *o) {
 // Works on the rack's filter-group list like FL does; channels outside the group
 // must stay where they are.
 static void do_order(const QItem *it) {
-    int n = it->order[0], i, j, steps = 0;
+    int n, i, j, steps = 0, selected = 0;
+    if (!it->order || (n = it->order[0]) < 0 || n > MAX_CH) {
+        sharing_fail("Channel order: session stopped", "The shared channel order is invalid. Your channel selection was kept."); return;
+    }
     const int *from = it->order + 1;
     void **items, **filt;
     static void *M[MAX_CH], *T[MAX_CH], *D[MAX_CH];
@@ -1936,6 +1952,8 @@ static void do_order(const QItem *it) {
         }
     }
     for (i = 0; i < n; i++) { M[i] = items[i]; T[i] = items[from[i]]; }
+    for (i = 0; i < n && from[i] == i; i++) {}
+    if (i == n) return;
     int nf = chan_list_filtered(&filt), nd = 0;
     if (!filt) return;
     for (i = 0; i < n; i++) {
@@ -1949,6 +1967,7 @@ static void do_order(const QItem *it) {
         obj = **(void ***)(g_flBase + (MOVEOBJ_VA - IMG_BASE));
         arg = **(int **)(g_flBase + (MOVEARG_VA - IMG_BASE));
         for (i = 0; i < n; i++) sel[i] = *((unsigned char *)M[i] + CH_SELECTED);
+        selected = 1;
         for (i = 0; i < nd; i++) {
             nf = chan_list_filtered(&filt);
             j = index_of(filt, nf, D[i]);
@@ -1963,8 +1982,11 @@ static void do_order(const QItem *it) {
                 j = j2;
             }
         }
-        for (i = 0; i < n; i++) *((unsigned char *)M[i] + CH_SELECTED) = sel[i];
     } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("chan.order faulted after %d moves", steps); }
+    if (selected) for (i = 0; i < n; i++) {
+        __try { *((unsigned char *)M[i] + CH_SELECTED) = sel[i]; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("chan.order selection restore failed at %d", i); }
+    }
     nm = chan_list(&items);
     int ok = nm == n;
     for (i = 0; ok && i < n; i++) ok = items[i] == T[i];
@@ -1974,6 +1996,7 @@ static void do_order(const QItem *it) {
         for (i = 0; i < nm; i++) { g_chU[i].hash = 0; g_chU[i].inst = plugin_inst(items[i]); g_chanPlugN[i] = 0; }
         plug_agreed_reset(1, 0);
         InterlockedIncrement(&g_structGen);
+        sharing_fail("Channel order: session stopped", "FL Studio could not reproduce the shared channel order. Reconnect and resync before continuing to share.");
     }
     known_from_list();
     notes_rebaseline(1);
@@ -7257,7 +7280,7 @@ static void handle_msg_inner(const char *m) {
 #define SAMPLE_PATH_MAX  1024
 #define BLOB_CHUNK       (256 * 1024)
 
-typedef struct { wchar_t *path; uint64_t size; FILETIME mt; char hex[65]; } HashEnt;
+typedef struct { wchar_t *path; uint64_t size; FILETIME mt; char hex[65]; LONG peerGen; } HashEnt;
 typedef struct { wchar_t *from, *to; } PathMap;
 typedef struct OutItem { LONG gen; char *msg; unsigned char *blob; size_t blobn, bytes; struct OutItem *next; } OutItem;
 typedef struct InItem { LONG gen; char *msg; size_t bytes; struct InItem *next; } InItem;
@@ -7339,6 +7362,7 @@ static int is_abs_path(const wchar_t *p) {
 }
 
 static int hash_file(const wchar_t *p, char hex[65]) {
+    hex[0] = 0;
     HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, NULL,
                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     unsigned char *buf;
@@ -7348,7 +7372,7 @@ static int hash_file(const wchar_t *p, char hex[65]) {
     if (f == INVALID_HANDLE_VALUE) return 0;
     if (!sha_begin(&s)) { CloseHandle(f); return 0; }
     buf = (unsigned char *)malloc(BLOB_CHUNK * 4);
-    if (!buf) { sha_end(&s, hex); CloseHandle(f); return 0; }
+    if (!buf) { sha_end(&s, hex); hex[0] = 0; CloseHandle(f); return 0; }
     for (;;) {
         if (!session_current()) { ok = 0; break; }
         if (!ReadFile(f, buf, BLOB_CHUNK * 4, &got, NULL)) { ok = 0; break; }
@@ -7358,6 +7382,7 @@ static int hash_file(const wchar_t *p, char hex[65]) {
     if (!sha_end(&s, hex)) ok = 0;
     free(buf);
     CloseHandle(f);
+    if (!ok) hex[0] = 0;
     return ok;
 }
 
@@ -7371,6 +7396,7 @@ static void hash_put(const wchar_t *p, uint64_t size, FILETIME mt, const char *h
         if (g_nhash == HASH_CACHE_MAX) {
             i = (int)(g_hashEvict++ % HASH_CACHE_MAX);
             free(g_hashes[i].path); g_hashes[i].path = copy;
+            g_hashes[i].peerGen = 0;
         } else {
             if (g_nhash == g_caphash) {
                 int cap = g_caphash ? g_caphash * 2 : 256;
@@ -7378,9 +7404,9 @@ static void hash_put(const wchar_t *p, uint64_t size, FILETIME mt, const char *h
                 if (!entries) { free(copy); LeaveCriticalSection(&g_sampleLock); return; }
                 g_hashes = entries; g_caphash = cap;
             }
-            g_hashes[g_nhash++].path = copy;
+            g_hashes[g_nhash].peerGen = 0; g_hashes[g_nhash++].path = copy;
         }
-    }
+    } else if (g_hashes[i].size != size || CompareFileTime(&g_hashes[i].mt, &mt) || strcmp(g_hashes[i].hex, hex)) g_hashes[i].peerGen = 0;
     g_hashes[i].size = size; g_hashes[i].mt = mt;
     strcpy_s(g_hashes[i].hex, sizeof(g_hashes[i].hex), hex);
     LeaveCriticalSection(&g_sampleLock);
@@ -7391,7 +7417,8 @@ static int sample_hash(const wchar_t *p, char hex[65], uint64_t *size) {
     FILETIME mt;
     uint64_t sz;
     int i, hit = 0;
-    if (!file_info(p, &sz, &mt) || sz > SAMPLE_MAX_BYTES) return 0;
+    hex[0] = 0; *size = 0;
+    if (!session_current() || !file_info(p, &sz, &mt) || !sz || sz > SAMPLE_MAX_BYTES) return 0;
     EnterCriticalSection(&g_sampleLock);
     for (i = 0; i < g_nhash; i++)
         if (_wcsicmp(g_hashes[i].path, p) == 0 && g_hashes[i].size == sz && CompareFileTime(&g_hashes[i].mt, &mt) == 0) {
@@ -7401,7 +7428,7 @@ static int sample_hash(const wchar_t *p, char hex[65], uint64_t *size) {
     if (!hit) {
         FILETIME after; uint64_t afterSize;
         if (!hash_file(p, hex)) return 0;
-        if (!file_info(p, &afterSize, &after) || afterSize != sz || CompareFileTime(&after, &mt)) return 0;
+        if (!file_info(p, &afterSize, &after) || afterSize != sz || CompareFileTime(&after, &mt) || !session_current()) {hex[0] = 0; return 0;}
         hash_put(p, sz, mt, hex);
     }
     *size = sz;
@@ -7411,7 +7438,10 @@ static int sample_hash(const wchar_t *p, char hex[65], uint64_t *size) {
 // Any local file known to have this content (and unchanged since it was hashed).
 static int find_by_hash(const char *hex, wchar_t *out, int cap) {
     int i = 0;
+    if (cap <= 0) return 0;
+    out[0] = 0;
     for (;;) {
+        if (!session_current()) return 0;
         wchar_t *path = NULL; uint64_t expected = 0, sz; FILETIME mt, expectedMt;
         EnterCriticalSection(&g_sampleLock);
         while (i < g_nhash) {
@@ -7438,6 +7468,7 @@ static void map_set(const wchar_t *from, const wchar_t *to) {
     } else {
         wchar_t *target = _wcsdup(to), *source = i == g_npmap ? _wcsdup(from) : NULL;
         if (!target || (i == g_npmap && !source)) failed = 1;
+        if (i == g_npmap && g_npmap >= SAMPLE_PATH_MAX * 8) failed = 1;
         if (!failed && i == g_npmap && g_npmap == g_cappmap) {
             int cap = g_cappmap ? g_cappmap * 2 : 64;
             PathMap *entries = (PathMap *)realloc(g_pmap, sizeof(PathMap) * cap);
@@ -8199,6 +8230,8 @@ static DWORD blob_http(const wchar_t *verb, const char *what, const wchar_t *up,
     unsigned char *buf = NULL;
     HANDLE f = INVALID_HANDLE_VALUE;
     size_t pl;
+    if (downHex) downHex[0] = 0;
+    if (resp && respCap > 0) resp[0] = 0;
     if (g_peerHttp) { if (!session_current() || !peer_endpoint(&u, key)) return 0; }
     else {
         EnterCriticalSection(&g_sampleLock);
@@ -8209,7 +8242,7 @@ static DWORD blob_http(const wchar_t *verb, const char *what, const wchar_t *up,
     wcscpy_s(path, 700, u.path);
     pl = wcslen(path);
     while (pl && path[pl - 1] == L'/') path[--pl] = 0;
-    MultiByteToWideChar(CP_UTF8, 0, what, -1, wwhat, 200);
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, what, -1, wwhat, 200) || pl + wcslen(wwhat) >= 700) goto out;
     wcscat_s(path, 700, wwhat);
     swprintf_s(hdr, 128, L"x-flim-key: %S\r\n", key);
     ses = WinHttpOpen(L"flim/1.0", g_peerHttp ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -8217,7 +8250,7 @@ static DWORD blob_http(const wchar_t *verb, const char *what, const wchar_t *up,
     if (!ses) goto out;
     WinHttpSetTimeouts(ses, 15000, 15000, !strcmp(what, "/blobs/missing") ? 10000 : 120000,
                        !strcmp(what, "/blobs/missing") ? 10000 : 120000);
-    if (g_peerHttp) WinHttpSetTimeouts(ses, 500, 500, 2000, down ? 8000 : 2000);
+    if (g_peerHttp) WinHttpSetTimeouts(ses, 500, 500, 2000, down ? 12000 : 2000);
     con = WinHttpConnect(ses, u.host, u.port, 0);
     if (!con) goto out;
     req = WinHttpOpenRequest(con, verb, path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, u.secure ? WINHTTP_FLAG_SECURE : 0);
@@ -8228,8 +8261,10 @@ static DWORD blob_http(const wchar_t *verb, const char *what, const wchar_t *up,
     if (!buf) { err = ERROR_NOT_ENOUGH_MEMORY; goto out; }
     if (up) {
         uint64_t left = upSize;
-        f = CreateFileW(up, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        LARGE_INTEGER actual;
+        f = CreateFileW(up, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
         if (f == INVALID_HANDLE_VALUE) goto out;
+        if (!GetFileSizeEx(f, &actual) || actual.QuadPart < 0 || (uint64_t)actual.QuadPart != upSize || upSize > MAXDWORD) {err = ERROR_FILE_INVALID; goto out;}
         if (!WinHttpSendRequest(req, hdr, (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, (DWORD)upSize, 0)) goto out;
         while (left) {
             DWORD want = left > BLOB_CHUNK ? BLOB_CHUNK : (DWORD)left, got = 0, sent = 0;
@@ -8250,8 +8285,8 @@ static DWORD blob_http(const wchar_t *verb, const char *what, const wchar_t *up,
         f = INVALID_HANDLE_VALUE;
     } else if (!WinHttpSendRequest(req, hdr, (DWORD)-1L, (LPVOID)body, bodyN, bodyN, 0)) goto out;
     if (!WinHttpReceiveResponse(req, NULL)) goto out;
-    WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-                        &status, &sl, WINHTTP_NO_HEADER_INDEX);
+    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                        &status, &sl, WINHTTP_NO_HEADER_INDEX)) {status = 0; goto out;}
     if (status == 429 || status == 507) {
         char reason[1024];
         DWORD used = 0, got = 0;
@@ -8261,7 +8296,7 @@ static DWORD blob_http(const wchar_t *verb, const char *what, const wchar_t *up,
         if (g_sampleHttp) {
             InterlockedExchange64(&g_sampleBlockedUntil, (LONG64)(GetTickCount64() + 60000));
             logmsg("SAMPLES file allowance reached (HTTP %lu): file transfers paused; room stays connected", status);
-        } else blob_limit_error(status, reason);
+        } else if (!g_peerHttp) blob_limit_error(status, reason);
         goto out;
     }
     if (status == 200 && down) {
@@ -8303,12 +8338,14 @@ static DWORD blob_http(const wchar_t *verb, const char *what, const wchar_t *up,
         resp[o] = 0;
     }
 out:
+    if (status != 200 && downHex) downHex[0] = 0;
     if (!status) logmsg("SAMPLES %S %s failed (%lu)", verb, what, err ? err : GetLastError());
     if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
     free(buf);
     if (req) WinHttpCloseHandle(req);
     if (con) WinHttpCloseHandle(con);
     if (ses) WinHttpCloseHandle(ses);
+    SecureZeroMemory(key, sizeof(key)); SecureZeroMemory(hdr, sizeof(hdr));
     return status;
 }
 
@@ -8316,11 +8353,13 @@ static DWORD sample_http(const wchar_t *verb, const char *what, const wchar_t *u
                          const char *body, DWORD bodyN, const wchar_t *down, char *downHex, char *resp, int respCap, uint64_t expectedBytes) {
     DWORD status = 0; int attempt;
     uint64_t startDone = g_xferDone;
+    uint64_t startFileDone = ff_active ? ff_current.done : 0;
     g_sampleLocalError = g_sampleVerificationError = 0;
     if (g_peerReady && down && downHex && expectedBytes && !wcscmp(verb, L"GET") && strlen(what) == 70 && !strncmp(what, "/blob/", 6) && is_hex64(what + 6)) {
         NetUrl peer; char peerKey[65], request[160];
         if (peer_endpoint(&peer, peerKey)) {
             uint64_t fileDone = ff_active ? ff_current.done : 0;
+            SecureZeroMemory(peerKey, sizeof(peerKey));
             sprintf_s(request, sizeof(request), "%s?bytes=%llu&generation=%ld", what, (unsigned long long)expectedBytes, g_netGen);
             g_peerHttp = 1;
             status = blob_http(verb, request, NULL, 0, NULL, 0, down, downHex, NULL, 0, expectedBytes);
@@ -8336,7 +8375,7 @@ static DWORD sample_http(const wchar_t *verb, const char *what, const wchar_t *u
     for (attempt = 0; attempt < 2 && session_current() && !g_compatFault; attempt++) {
         if (attempt) {
             g_xferDone = startDone;
-            if (ff_active) { ff_current.done = 0; strcpy_s(ff_current.reason, sizeof(ff_current.reason), "retrying"); ff_save(); }
+            if (ff_active) { ff_current.done = startFileDone; strcpy_s(ff_current.reason, sizeof(ff_current.reason), "retrying"); ff_save(); }
             Sleep(150);
         }
         g_sampleHttp = 1;
@@ -8345,7 +8384,7 @@ static DWORD sample_http(const wchar_t *verb, const char *what, const wchar_t *u
         if (g_sampleLocalError || g_sampleVerificationError) break;
         if (status && status != 502 && status != 503 && status != 504) break;
     }
-    if (sample_retryable(status, down != NULL)) g_sampleRetry = 1;
+    if (sample_retryable(status, down != NULL) || (up && status == 409)) g_sampleRetry = 1;
     return status;
 }
 
@@ -8353,24 +8392,38 @@ static void peer_welcome(const char *message) {
     FlJson root = {message, strlen(message)}, value;
     NetUrl peer; char key[65], token[65], body[160];
     InterlockedExchange(&g_peerReady, 0);
-    if (!g_cloudTransport || !peer_endpoint(&peer, key) || !fj_get(root, "file_peer", &value) || !fj_text(value, token, sizeof(token)) || strlen(token) != 64 || !is_hex64(token)) return;
+    if (!g_cloudTransport || !peer_endpoint(&peer, key) || !fj_get(root, "file_peer", &value) || !fj_text(value, token, sizeof(token)) || strlen(token) != 64 || !is_hex64(token)) goto done;
     sprintf_s(body, sizeof(body), "{\"token\":\"%s\",\"generation\":%ld}", token, g_netGen);
     g_peerHttp = 1;
     if (blob_http(L"POST", "/connect", NULL, 0, body, (DWORD)strlen(body), NULL, NULL, NULL, 0, 0) == 200) InterlockedExchange(&g_peerReady, 1);
     g_peerHttp = 0;
+done:
     SecureZeroMemory(key, sizeof(key)); SecureZeroMemory(token, sizeof(token)); SecureZeroMemory(body, sizeof(body));
 }
 
 static void peer_offer(const wchar_t *path, const char *hash, uint64_t bytes) {
-    NetUrl peer; char key[65], *body; size_t cap, at;
-    if (!g_peerReady || !g_cloudTransport || !peer_endpoint(&peer, key)) return;
+    NetUrl peer; char key[65], *body = NULL; size_t cap, at; int i, cached = 0; FILETIME mt = {0}; LONG generation = g_netGen; DWORD status;
+    if (!g_peerReady || !g_cloudTransport || generation <= 0 || !session_current() || !path || !hash || !is_hex64(hash) || !bytes || bytes > FLIM_CLOUD_FILE_MAX || wcslen(path) >= SAMPLE_PATH_MAX || !peer_endpoint(&peer, key)) goto done;
+    EnterCriticalSection(&g_sampleLock);
+    for (i = 0; i < g_nhash; i++) if (!_wcsicmp(g_hashes[i].path, path) && g_hashes[i].size == bytes && !strcmp(g_hashes[i].hex, hash)) {
+        if (g_hashes[i].peerGen == generation) {LeaveCriticalSection(&g_sampleLock); goto done;}
+        cached = 1; mt = g_hashes[i].mt; break;
+    }
+    LeaveCriticalSection(&g_sampleLock);
     cap = ((wcslen(path) * 2 + 2) / 3) * 4 + 180;
-    body = (char *)malloc(cap); if (!body) return;
-    at = sprintf_s(body, cap, "{\"generation\":%ld,\"h\":\"%s\",\"s\":%llu,\"p\":\"", g_netGen, hash, (unsigned long long)bytes);
+    body = (char *)malloc(cap); if (!body) goto done;
+    at = sprintf_s(body, cap, "{\"generation\":%ld,\"h\":\"%s\",\"s\":%llu,\"p\":\"", generation, hash, (unsigned long long)bytes);
     b64enc((const unsigned char *)path, (int)(wcslen(path) * 2), body + at); strcat_s(body, cap, "\"}");
     g_peerHttp = 1;
-    if (!blob_http(L"POST", "/offer", NULL, 0, body, (DWORD)strlen(body), NULL, NULL, NULL, 0, 0)) InterlockedExchange(&g_peerReady, 0);
+    status = blob_http(L"POST", "/offer", NULL, 0, body, (DWORD)strlen(body), NULL, NULL, NULL, 0, 0);
+    if (!status) InterlockedExchange(&g_peerReady, 0);
     g_peerHttp = 0;
+    if (status == 200 && cached && generation == g_netGen && session_current()) {
+        EnterCriticalSection(&g_sampleLock);
+        for (i = 0; i < g_nhash; i++) if (!_wcsicmp(g_hashes[i].path, path) && g_hashes[i].size == bytes && !CompareFileTime(&g_hashes[i].mt, &mt) && !strcmp(g_hashes[i].hex, hash)) {g_hashes[i].peerGen = generation; break;}
+        LeaveCriticalSection(&g_sampleLock);
+    }
+done:
     SecureZeroMemory(key, sizeof(key)); free(body);
 }
 
@@ -8422,13 +8475,16 @@ static void group_digits(uint64_t v, wchar_t *out, int cap) {
 // Outbox thread: list (and upload) the samples an outgoing project / channel state uses.
 // Returns the message with "samples":[...] spliced in, or NULL to send it unchanged.
 static char *samples_attach(const char *msg, const unsigned char *blob, size_t n) {
+    FlJson root = {msg, strlen(msg)}, operation, existing;
     PathList L;
     SEnt *E = NULL;
     int i, j, ne = 0, nup = 0;
     uint64_t upBytes = 0;
     char *out = NULL;
     memset(&L, 0, sizeof(L));
-    flp_walk(blob, n, collect_cb, &L);
+    if (!session_current()) return NULL;
+    if (!fj_get(root, "op", &operation) || operation.n < 2 || operation.p[0] != '{' || fj_get(operation, "samples", &existing)) goto invalid;
+    if (!flp_walk(blob, n, collect_cb, &L)) goto invalid;
     if (L.failed) goto memory_failed;
     if (!L.n || !g_blobOn) goto done;
     E = (SEnt *)calloc((size_t)L.n, sizeof(SEnt));
@@ -8436,11 +8492,13 @@ static char *samples_attach(const char *msg, const unsigned char *blob, size_t n
     for (i = 0; i < L.n; i++) {
         wchar_t full[SAMPLE_PATH_MAX];
         uint64_t bytes;
+        if (!session_current() || g_compatFault) goto done;
         if (!expand_path(L.paths[i], full, SAMPLE_PATH_MAX)) continue;
         if (!file_info(full, &bytes, NULL)) { ff_begin(full, NULL, "upload", 0, "missing"); ff_finish("missing", "source_missing"); continue; }
         if (!sample_sendable(bytes)) { ff_begin(full, NULL, "upload", bytes, "failed"); ff_finish("failed", bytes ? "too_large" : "empty"); continue; }
         ff_begin(full, NULL, "upload", bytes, "checking");
         if (!sample_hash(full, E[ne].hex, &E[ne].size)) { ff_finish("failed", "source_changed"); continue; }
+        if (!sample_sendable(E[ne].size)) {ff_finish("failed", E[ne].size ? "too_large" : "empty"); continue;}
         ff_identify(E[ne].hex);
         ff_finish("checking", "");
         E[ne].p = L.paths[i];
@@ -8491,14 +8549,13 @@ static char *samples_attach(const char *msg, const unsigned char *blob, size_t n
         xfer_end();
     }
     {   // splice "samples":[...] in front of the op's fields
-        const char *op = strstr(msg, "\"op\":{");
+        const char *op = operation.p + 1;
         size_t cap = strlen(msg) + 64, len;
         int k = 0;
-        if (!op) goto done;
         for (i = 0; i < ne; i++) cap += wcslen(E[i].p) * 3 + 120;
         out = (char *)malloc(cap);
         if (!out) goto memory_failed;
-        len = (size_t)(op + 6 - msg);
+        len = (size_t)(op - msg);
         memcpy(out, msg, len);
         len += sprintf_s(out + len, cap - len, "\"samples\":[");
         for (i = 0; i < ne; i++) {
@@ -8508,10 +8565,14 @@ static char *samples_attach(const char *msg, const unsigned char *blob, size_t n
             len += strlen(out + len);
             len += sprintf_s(out + len, cap - len, "\",\"h\":\"%s\",\"s\":%llu}", E[i].hex, (unsigned long long)E[i].size);
         }
-        len += sprintf_s(out + len, cap - len, "],");
-        strcpy_s(out + len, cap - len, op + 6);
+        { const char *tail = op; fj_space(&tail, operation.p + operation.n);
+          len += sprintf_s(out + len, cap - len, *tail == '}' ? "]" : "],"); }
+        strcpy_s(out + len, cap - len, op);
         logmsg("SAMPLES op lists %d samples (%d uploaded)", k, nup);
     }
+    goto done;
+invalid:
+    sharing_fail("Sample transfer: session stopped", "The shared preset or its sample metadata is malformed. No sample files were transferred.");
     goto done;
 memory_failed:
     sharing_fail("Sample transfer: session stopped", "The sample list exceeded its limit or available memory. Reconnect and resync before continuing to share.");
@@ -8777,16 +8838,17 @@ next_sample:
         if (!g_noLocal && expand_path(R[i].p, full, SAMPLE_PATH_MAX) && full[1] == L':' && sample_hash(full, hx, &sz) && sz == R[i].size && strcmp(hx, R[i].hex) == 0) {
             map_set(R[i].p, NULL);                      // the same file is right where the peer has it
             ff_begin(R[i].p, R[i].hex, "download", R[i].size, "ready"); ff_finish("ready", "local_cache");
+            peer_offer(full, R[i].hex, R[i].size);
             continue;
         }
         if (!g_noLocal && find_by_hash(R[i].hex, found, SAMPLE_PATH_MAX) && file_info(found, &sz, NULL) && sz == R[i].size) {
-            map_set(R[i].p, found); ff_begin(R[i].p, R[i].hex, "download", R[i].size, "ready"); ff_finish("ready", "local_cache"); continue;
+            map_set(R[i].p, found); ff_begin(R[i].p, R[i].hex, "download", R[i].size, "ready"); ff_finish("ready", "local_cache"); peer_offer(found, R[i].hex, R[i].size); continue;
         }
         if (!cache_path(R[i].hex, R[i].p, R[i].cache, MAX_PATH * 2)) {
             map_set(R[i].p, NULL); ff_begin(R[i].p, R[i].hex, "download", R[i].size, "waiting"); sample_local_failed(); goto done;
         }
         if (sample_hash(R[i].cache, hx, &sz) && sz == R[i].size && strcmp(hx, R[i].hex) == 0) {
-            map_set(R[i].p, R[i].cache); ff_begin(R[i].p, R[i].hex, "download", R[i].size, "ready"); ff_finish("ready", "local_cache"); continue;
+            map_set(R[i].p, R[i].cache); ff_begin(R[i].p, R[i].hex, "download", R[i].size, "ready"); ff_finish("ready", "local_cache"); peer_offer(R[i].cache, R[i].hex, R[i].size); continue;
         }
         /* A replacement must never reuse the previous contents at this peer path. */
         map_set(R[i].p, NULL);
@@ -8809,10 +8871,10 @@ next_sample:
             { int prior;
               for (prior = 0; prior < i; prior++) if (!strcmp(R[prior].hex, R[i].hex) &&
                   sample_hash(R[prior].cache, hx, &sz) && sz == R[i].size && !strcmp(hx, R[i].hex)) break;
-              if (prior < i) { map_set(R[i].p, R[prior].cache); ff_begin(R[i].p, R[i].hex, "download", R[i].size, "ready"); ff_finish("ready", "local_cache"); continue; }
+              if (prior < i) { map_set(R[i].p, R[prior].cache); ff_begin(R[i].p, R[i].hex, "download", R[i].size, "ready"); ff_finish("ready", "local_cache"); peer_offer(R[prior].cache, R[i].hex, R[i].size); continue; }
             }
             if (sample_hash(R[i].cache, hx, &sz) && sz == R[i].size && strcmp(hx, R[i].hex) == 0) {
-                map_set(R[i].p, R[i].cache); ff_begin(R[i].p, R[i].hex, "download", R[i].size, "ready"); ff_finish("ready", "local_cache"); continue;
+                map_set(R[i].p, R[i].cache); ff_begin(R[i].p, R[i].hex, "download", R[i].size, "ready"); ff_finish("ready", "local_cache"); peer_offer(R[i].cache, R[i].hex, R[i].size); continue;
             }
             wcscpy_s(dir, MAX_PATH * 2, R[i].cache);
             slash = wcsrchr(dir, L'\\');
@@ -8831,6 +8893,7 @@ next_sample:
                 if (file_info(R[i].cache, &sz, &mt)) hash_put(R[i].cache, sz, mt, R[i].hex);
                 map_set(R[i].p, R[i].cache);
                 ff_finish("ready", "downloaded");
+                peer_offer(R[i].cache, R[i].hex, R[i].size);
                 downloaded++;
                 logmsg("SAMPLES downloaded %S (%llu bytes)", R[i].cache, (unsigned long long)R[i].size);
             } else {

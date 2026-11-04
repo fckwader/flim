@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
   await fs.mkdir(root,{recursive:true});
   const directory=await fs.mkdtemp(path.join(root,'transfer-'));
   const batches=[], failures=[];
-  let mode = 'normal', modeCalls = 0, redirectsFollowed = 0;
+  let mode = 'normal', modeCalls = 0, redirectsFollowed = 0, offers = 0;
   const server=http.createServer(async(req,res)=>{
     try{
       const chunks=[];for await(const chunk of req)chunks.push(chunk);
@@ -19,10 +19,13 @@ const assert = require('node:assert/strict');
       }else if(req.url==='/connect'){
         assert.equal(JSON.parse(body).token,'2'.repeat(64));res.end();
       }else if(req.url==='/offer'){
-        assert.equal(JSON.parse(body).s,65569);res.end();
+        assert.equal(JSON.parse(body).s,65569);offers++;res.end();
+      }else if(req.url==='/offer-count'){
+        res.end(String(offers));
       }else if(/^\/blob\/[a-f0-9]{64}(?:\?|$)/.test(req.url)){
         const direct=req.headers['x-flim-key']==='1'.repeat(64);
         if(direct && mode==='peer-missing'){res.writeHead(404);res.end();return;}
+        if(direct && mode==='peer-throttle'){res.writeHead(429);res.end('{"code":"local_busy"}');return;}
         res.end(direct && mode==='peer-corrupt'?'wrong transfer content':'flim transfer download');
       }else if(req.url==='/blobs/missing'){
         const hashes=body.toString().trim().split('\n');
@@ -34,7 +37,7 @@ const assert = require('node:assert/strict');
       }else if(req.url==='/blob/upload'){
         assert.equal(body.length,65569);
         for(let i=0;i<body.length;i++)assert.equal(body[i],i%251);
-        res.writeHead(201);res.end();
+        res.writeHead(mode==='upload-conflict'?409:201);res.end();
       }else if(req.url==='/blob/redirect'){
         res.writeHead(302, {location: '/blob/redirect-target'});res.end();
       }else if(req.url==='/blob/redirect-target'){

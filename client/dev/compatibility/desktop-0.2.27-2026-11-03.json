@@ -1,0 +1,79 @@
+{
+  "version": "0.2.27",
+  "date": "2026-11-04T02:05:55.373Z",
+  "localDate": "2026-11-03",
+  "sourceBaseline": "2555c89",
+  "uncommittedChanges": true,
+  "includesLocalVersion": "0.2.26",
+  "localOnly": true,
+  "additionalFixesAndSafeguards": 57,
+  "reviewedBuilds": [
+    "24.2.2.4597",
+    "25.2.5.5319",
+    "26.1.7.5654"
+  ],
+  "profilesChanged": false,
+  "frontendChanged": false,
+  "workerChanged": false,
+  "artifact": {
+    "file": "client/desktop/release/flim-rooms-0.2.27-win64.exe",
+    "bytes": 103587987,
+    "sha256": "d98c6554928528743c060001d08896d04805b9f991747e01b435efbcdfc14202"
+  },
+  "native": {
+    "launcher": "4e098c180294b29e56333b2f7f7ace2d1a8e55f52123b7fe1e3125b3ef18c9db",
+    "engine": "d06c112d0e8d652a58c11e99aa6f8e2a026155ac9ce1a7b0d92e59f0e7205b37"
+  },
+  "desktopTests": 246,
+  "additionalDesktopTests": 22,
+  "nativeHarnessExecutables": 33,
+  "syntheticNativeHostMemberCombinations": 9,
+  "nativeHttpChecks": 19,
+  "nativeFileSyncAndStatusChecks": 18,
+  "roomUiChecks": 127,
+  "filesUiChecks": 68,
+  "localCloudflareTests": 76,
+  "nativeHttpLoopback": true,
+  "nativeFileSyncLoopback": true,
+  "packagedStartup": true,
+  "portableStartup": true,
+  "realElectron": [
+    "folder dialog and persistence",
+    "window, mode and 200% zoom",
+    "sidebar geometry and focus",
+    "bounded renderer recovery"
+  ],
+  "peerFiles": {
+    "local": {
+      "passed": true,
+      "bytes": 2097171,
+      "participants": 3,
+      "directDownloads": 5,
+      "concurrentDownloads": 2,
+      "forcedR2Reads": 1,
+      "checks": [
+        "Actual Electron WebRTC through local Cloudflare emulation",
+        "Worker crash recovery",
+        "Changed first source and alternate-source recovery",
+        "Verified recipient serves onward",
+        "Authentication and stale generation rejection",
+        "R2 fallback"
+      ]
+    },
+    "deployedRelayTestedThisPass": false
+  },
+  "limits": [
+    "Synthetic native fixtures do not establish physical FL behavior",
+    "No new physical MIDI or two-computer session",
+    "No remote NAT or long internet soak",
+    "Not every FL patch or VST state version",
+    "Earlier intermittent FL24 recovery-save stall unresolved",
+    "Native faults and channel mismatches can pause sharing while leaving FL open",
+    "Host departure still ends the room",
+    "R2 initial uploads and usage guards remain",
+    "No TURN; full sessions still trust the relay"
+  ],
+  "userFlOperated": false,
+  "githubWrites": false,
+  "cloudflareDeployment": false
+}
